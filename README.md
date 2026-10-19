@@ -25,6 +25,8 @@ Weak-onset fragments of the same pitch are joined across gaps of up to 80 ms bef
 
 Automatic harmonic cleanup removes much quieter overtones sharing a start and most of their duration with a lower note, while keeping strong octave doublings.
 
+Chords are aligned within 30 ms while preserving note endings and separate same-pitch re-strikes; velocities expand the conversion's 5th–95th amplitude percentiles to 0.35–0.95. Short notes below 35% of their local median amplitude are removed, so uniformly soft passages are preserved.
+
 Choose a file, press **Convert**, then **Download MIDI**. The download keeps the original filename with a `.mid` extension.
 
 ## Command line
@@ -37,13 +39,17 @@ node cli.mjs "song.mp3" --out "song.mid" --json
 
 The CLI uses the same extraction, smoothing, and MIDI code as the browser. It decodes to mono 22050 Hz, loads `public/model` locally, and runs inference on the CPU. The first run can take several minutes; model outputs are saved in `.cache/` so changing parameters skips inference. Cache entries are checked against the source path, size, modification time, and model timestamp. Delete the corresponding cache file to force inference again.
 
-Options: `--onset`, `--frame`, `--min` (milliseconds), `--poly`, `--tolerance` (model frames), `--legato` (weak-onset threshold; `0` disables fragment smoothing), `--harmonic` (amplitude ratio; `0` disables harmonic cleanup), and `--no-split`. Run `node cli.mjs --help` for defaults. Without `--out`, MIDI is written beside the input with a `.mid` extension.
+Options: `--onset`, `--frame`, `--min` (milliseconds), `--poly`, `--tolerance` (model frames), `--legato` (weak-onset threshold; `0` disables fragment smoothing), `--harmonic` (amplitude ratio; `0` disables harmonic cleanup), `--align` (milliseconds within a chord group; `0` disables), `--ghost` (local amplitude ratio; `0` disables), `--no-dynamics`, and `--no-split`. Run `node cli.mjs --help` for defaults. Without `--out`, MIDI is written beside the input with a `.mid` extension.
 
-Browser and CLI defaults are onset `0.5`, frame `0.3`, minimum `80` ms, polyphony `6`, energy tolerance `11` frames, legato `0.65`, harmonic `0.6`, and split hands enabled. Harmonic cleanup considers notes 12, 19, or 24 semitones above a louder note, with starts within 30 ms and at least 60% duration overlap. For the original behaviour, use `--min 60 --legato 0 --harmonic 0`.
+Browser and CLI defaults are onset `0.5`, frame `0.3`, minimum `80` ms, polyphony `6`, energy tolerance `11` frames, legato `0.65`, harmonic `0.6`, alignment `30` ms, ghost ratio `0.35`, dynamics and split hands enabled. Harmonic cleanup considers notes 12, 19, or 24 semitones above a louder note, with starts within 30 ms and at least 60% duration overlap. For the original behaviour, use `--min 60 --legato 0 --harmonic 0 --align 0 --ghost 0 --no-dynamics`.
+
+Alignment uses the earliest chord start that does not overlap a previous note of the same pitch, preserving original ends with a minimum duration of 1 ms. Dynamics uses one linear percentile mapping clamped to 0.1–1, or 0.7 when the percentile range is constant; `--no-dynamics` restores the raw amplitude clamp. Quiet cleanup compares notes shorter than 150 ms against the median raw amplitude of notes starting within ±1 second, before alignment and velocity mapping. Use `--align 0 --ghost 0 --no-dynamics` to restore the loop-1 processing.
 
 Statistics include note count, last note end in seconds, notes/second, median duration, percentage under 100 ms, same-pitch pairs separated by at most 50 ms, their later notes' mean onset strength, and peak sounding notes. Strong repeated notes also count in the fragment statistic. `--json` prints one JSON object to stdout; progress goes to stderr.
 
 `harmonicPairs` counts upper notes with a note 12, 19, or 24 semitones below starting within 30 ms; `harmonicPairsWeak` counts those below 0.6 times a qualifying lower note's raw amplitude, regardless of duration overlap.
+
+`chordGroups` counts groups of at least two notes starting within 30 ms of the first note, and `meanChordSpreadMs` measures their average start spread. `velocityP5`, `velocityP50`, and `velocityP95` describe final velocities before MIDI quantization; `quietShortNotes` counts remaining notes shorter than 150 ms and below 0.35 times their local median raw amplitude.
 
 ## Getting the MIDI onto a Meta Quest 3
 

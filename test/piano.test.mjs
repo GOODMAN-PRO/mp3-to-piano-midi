@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import midiPackage from '@tonejs/midi/build/Midi.js';
 import { extractNotes } from '../extract.js';
-import { toPianoNotes } from '../piano.js';
+import { toPianoNotes as pianoWithDefaults } from '../piano.js';
 import { notesToMidi } from '../midi.js';
 import { noteStats } from '../cli.mjs';
 
 const note = (pitchMidi, startTimeSeconds = 0, durationSeconds = 1, amplitude = 0.5) =>
   ({ pitchMidi, startTimeSeconds, durationSeconds, amplitude });
+// Keep the original processing assertions isolated from the new optional stages.
+const toPianoNotes = (notes, options = {}) =>
+  pianoWithDefaults(notes, { align: 0, dynamics: false, ghost: 0, ...options });
 
 assert.equal(toPianoNotes([note(10)])[0].pitch, 22);
 assert.equal(toPianoNotes([note(120)])[0].pitch, 108);
@@ -97,6 +100,53 @@ assert.deepEqual(toPianoNotes([note(60, 0, 1, 1), note(72, 0, 1, 0.5), note(67, 
 assert.deepEqual(toPianoNotes([note(72, 0, 1, 0.3), note(60, 0.02, 2, 1), note(64, 0.04, 1, 0.8)],
   { harmonic: 0.6, maxPoly: 1 }).map(n => n.pitch), [60, 64]);
 
+const smearedChord = [note(60, 1, 0.2), note(64, 1.02, 0.3), note(67, 1.04, 0.4)];
+const smearedOriginal = structuredClone(smearedChord);
+const alignedChord = pianoWithDefaults(smearedChord);
+assert.deepEqual(alignedChord.map(n => n.startTimeSeconds), [1, 1, 1.04]);
+for (let i = 0; i < alignedChord.length; i++) {
+  assert.ok(Math.abs(alignedChord[i].startTimeSeconds + alignedChord[i].durationSeconds
+    - (smearedChord[i].startTimeSeconds + smearedChord[i].durationSeconds)) < 1e-12);
+}
+assert.deepEqual(smearedChord, smearedOriginal);
+assert.deepEqual(pianoWithDefaults(smearedChord, { align: 0 }).map(n => n.startTimeSeconds), [1, 1.02, 1.04]);
+assert.deepEqual(pianoWithDefaults(smearedChord, { align: 10 }).map(n => n.startTimeSeconds), [1, 1.02, 1.04]);
+// Very short repeats inside one chord window must not become simultaneous notes of the same pitch.
+const fastRepeats = pianoWithDefaults([note(60, 0, 0.01), note(64, 0.005), note(60, 0.02, 0.1)]);
+assert.deepEqual(fastRepeats.map(n => n.startTimeSeconds), [0, 0, 0.02]);
+assert.equal(fastRepeats[0].durationSeconds, 0.01);
+// A common chord start cannot overlap an earlier note of the same pitch.
+const restrainedChord = pianoWithDefaults([note(60, 0, 1), note(60, 1, 0.5), note(64, 0.98, 0.5)]);
+const previousC = restrainedChord.find(n => n.pitch === 60 && n.startTimeSeconds === 0);
+const nextC = restrainedChord.find(n => n.pitch === 60 && n.startTimeSeconds === 1);
+const chordE = restrainedChord.find(n => n.pitch === 64);
+assert.equal(previousC.startTimeSeconds + previousC.durationSeconds, 1);
+assert.equal(nextC.startTimeSeconds, chordE.startTimeSeconds);
+assert.equal(nextC.startTimeSeconds + nextC.durationSeconds, 1.5);
+assert.equal(chordE.startTimeSeconds + chordE.durationSeconds, 1.48);
+const tinyChordNote = pianoWithDefaults([note(60, 0, 1), note(60, 1, 0.5), note(64, 0.98, 0.01)])
+  .find(n => n.pitch === 64);
+assert.ok(Math.abs(tinyChordNote.durationSeconds - 0.001) < 1e-12);
+
+const amplitudeRange = Array.from({ length: 101 }, (_, i) => note(60, i * 2, 1, i / 100));
+const dynamicNotes = pianoWithDefaults(amplitudeRange);
+assert.ok(Math.abs(dynamicNotes[5].velocity - 0.35) < 1e-12);
+assert.ok(Math.abs(dynamicNotes[50].velocity - 0.65) < 1e-12);
+assert.ok(Math.abs(dynamicNotes[95].velocity - 0.95) < 1e-12);
+assert.ok(dynamicNotes.every(n => n.velocity >= 0.1 && n.velocity <= 1));
+assert.deepEqual(pianoWithDefaults([note(60), note(64)]).map(n => n.velocity), [0.7, 0.7]);
+assert.deepEqual(pianoWithDefaults([note(60, 0, 1, 0), note(62, 2, 1, 0.5), note(64, 4, 1, 2)],
+  { dynamics: false }).map(n => n.velocity), [0.05, 0.5, 1]);
+
+const localDynamics = [
+  note(60, 0, 0.1, 0.1), note(62, 0.2, 0.1, 0.8), note(64, 0.4, 0.2, 0.1),
+  note(65, 0.6, 1, 0.8), note(67, 0.8, 1, 0.8),
+  note(60, 10, 0.1, 0.1), note(62, 10.2, 0.1, 0.1), note(64, 10.4, 0.1, 0.1),
+];
+const cleanedDynamics = pianoWithDefaults(localDynamics, { ghost: 0.35 });
+assert.deepEqual(cleanedDynamics.map(n => n.startTimeSeconds), [0.2, 0.4, 0.6, 0.8, 10, 10.2, 10.4]);
+assert.equal(pianoWithDefaults(localDynamics, { ghost: 0 }).length, localDynamics.length);
+
 assert.deepEqual(extractNotes([], []), []);
 const frames = Array.from({ length: 35 }, (_, i) =>
   Array.from({ length: 88 }, (_, pitch) => pitch === 39 && i >= 4 && i < 24 ? 0.7 : 0));
@@ -151,6 +201,7 @@ assert.deepEqual(noteStats([]), {
   notes: 0, seconds: 0, notesPerSec: 0, medianDurationMs: 0, pctUnder100ms: 0,
   fragments: 0, meanOnsetAtFragmentStart: 0, maxSoundingAtOnce: 0,
   harmonicPairs: 0, harmonicPairsWeak: 0,
+  chordGroups: 0, meanChordSpreadMs: 0, velocityP5: 0, velocityP50: 0, velocityP95: 0, quietShortNotes: 0,
 });
 const measuredNotes = [
   { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.08, onset: 0.9 },
@@ -190,5 +241,22 @@ assert.equal(noteStats([
   { pitch: 60, startTimeSeconds: 0, durationSeconds: 1, amplitude: 0.04, velocity: 0.05 },
   { pitch: 72, startTimeSeconds: 0, durationSeconds: 1, amplitude: 0.01, velocity: 0.05 },
 ]).harmonicPairsWeak, 1); // Compare raw amplitude, before the velocity floor.
+
+const chordStats = noteStats([
+  { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.2, amplitude: 0.5, velocity: 0.35 },
+  { pitch: 64, startTimeSeconds: 0.02, durationSeconds: 0.1, amplitude: 0.1, velocity: 0.1 },
+  { pitch: 67, startTimeSeconds: 0.04, durationSeconds: 0.2, amplitude: 0.5, velocity: 0.95 },
+]);
+assert.equal(chordStats.chordGroups, 1); // Groups use the first start, not a chain of adjacent gaps.
+assert.equal(chordStats.meanChordSpreadMs, 20);
+assert.equal(chordStats.quietShortNotes, 1);
+assert.ok(Math.abs(chordStats.velocityP5 - 0.125) < 1e-12);
+assert.equal(chordStats.velocityP50, 0.35);
+assert.ok(Math.abs(chordStats.velocityP95 - 0.89) < 1e-12);
+assert.equal(noteStats(toPianoNotes(localDynamics)).quietShortNotes, 1); // A whole soft passage stays quiet, not noisy.
+assert.equal(noteStats([
+  { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.1, amplitude: 0.1, velocity: 0.7 },
+  { pitch: 64, startTimeSeconds: 1, durationSeconds: 0.2, amplitude: 0.8, velocity: 0.7 },
+]).quietShortNotes, 1); // Include the ±1 s boundary and measure raw amplitude rather than velocity.
 
 console.log('piano, extraction, MIDI, and statistics tests passed');

@@ -1,4 +1,6 @@
-export function toPianoNotes(notes, { maxPoly = 6, legato = 0.65, harmonic = 0.6 } = {}) {
+export function toPianoNotes(notes, {
+  maxPoly = 6, legato = 0.65, harmonic = 0.6, align = 30, dynamics = true, ghost = 0.35,
+} = {}) {
   const sorted = notes.map(note => {
     let pitch = note.pitchMidi;
     while (pitch < 21) pitch += 12;
@@ -47,7 +49,7 @@ export function toPianoNotes(notes, { maxPoly = 6, legato = 0.65, harmonic = 0.6
     }
   }
 
-  const kept = [];
+  const chords = [];
   for (let i = 0; i < merged.length;) {
     let end = i + 1;
     while (end < merged.length &&
@@ -55,16 +57,66 @@ export function toPianoNotes(notes, { maxPoly = 6, legato = 0.65, harmonic = 0.6
     // Keep the original chord-group anchors, removing ghosts before they use a cap slot.
     const group = merged.slice(i, end).filter(note => !ghosts.has(note));
     group.sort((a, b) => b.amplitude - a.amplitude);
-    kept.push(...group.slice(0, maxPoly));
+    chords.push(group.slice(0, maxPoly).sort((a, b) => a.startTimeSeconds - b.startTimeSeconds));
     i = end;
   }
 
-  return kept.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds).map(note => ({
+  const percentile = (values, p) => {
+    if (!values.length) return 0;
+    const index = (values.length - 1) * p, lo = Math.floor(index), hi = Math.ceil(index);
+    return values[lo] + (values[hi] - values[lo]) * (index - lo);
+  };
+  const selected = chords.flat();
+  const quiet = new Set();
+  if (ghost > 0) {
+    let firstLocal = 0, lastLocal = 0;
+    for (const note of selected) {
+      while (selected[firstLocal].startTimeSeconds < note.startTimeSeconds - 1 - 1e-9) firstLocal++;
+      while (lastLocal < selected.length && selected[lastLocal].startTimeSeconds <= note.startTimeSeconds + 1 + 1e-9) lastLocal++;
+      if (note.end - note.startTimeSeconds >= 0.15) continue;
+      const local = selected.slice(firstLocal, lastLocal).map(n => n.amplitude).sort((a, b) => a - b);
+      if (note.amplitude < ghost * percentile(local, 0.5)) quiet.add(note);
+    }
+  }
+
+  const kept = [], previousEnds = new Map();
+  for (const chord of chords) {
+    const audible = chord.filter(note => !quiet.has(note));
+    for (let i = 0; i < audible.length;) {
+      let end = i + 1;
+      if (align > 0) {
+        const pitches = new Set([audible[i].pitch]);
+        while (end < audible.length && !pitches.has(audible[end].pitch) &&
+          audible[end].startTimeSeconds - audible[i].startTimeSeconds <= align / 1000 + 1e-9) {
+          pitches.add(audible[end].pitch);
+          end++;
+        }
+      }
+      const group = audible.slice(i, end);
+      // A shared start must not cross a previous re-strike's release; keep every original end.
+      const start = Math.max(group[0].startTimeSeconds, ...group.map(note => previousEnds.get(note.pitch) ?? 0));
+      for (const note of group) {
+        if (align > 0) {
+          note.startTimeSeconds = start;
+          note.end = Math.max(note.end, start + 0.001);
+        }
+        previousEnds.set(note.pitch, note.end);
+        kept.push(note);
+      }
+      i = end;
+    }
+  }
+
+  const amplitudes = kept.map(note => note.amplitude).sort((a, b) => a - b);
+  const p5 = percentile(amplitudes, 0.05), p95 = percentile(amplitudes, 0.95);
+  return kept.map(note => ({
     pitch: note.pitch,
     startTimeSeconds: note.startTimeSeconds,
     durationSeconds: note.end - note.startTimeSeconds,
     amplitude: note.amplitude,
-    velocity: Math.min(1, Math.max(0.05, note.amplitude)),
+    velocity: dynamics
+      ? p95 > p5 ? Math.min(1, Math.max(0.1, 0.35 + 0.6 * (note.amplitude - p5) / (p95 - p5))) : 0.7
+      : Math.min(1, Math.max(0.05, note.amplitude)),
     ...(note.onset === undefined ? {} : { onset: note.onset }),
   }));
 }
