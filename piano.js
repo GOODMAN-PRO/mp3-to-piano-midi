@@ -1,17 +1,22 @@
 export function toPianoNotes(notes, {
-  maxPoly = 6, legato = 0.65, harmonic = 0.6, align = 30, dynamics = true, ghost = 0.35, splitAt = 0,
+  maxPoly = 6, legato = 0.7, harmonic = 0.6, align = 30, dynamics = true, ghost = 0.35, splitAt = 0,
   preset = 'full', minSounding = 120, legatoGap = preset === 'easy' ? 150 : 100,
 } = {}) {
-  const sorted = notes.map(note => {
-    let pitch = note.pitchMidi;
-    while (pitch < 21) pitch += 12;
-    while (pitch > 108) pitch -= 12;
+  const sorted = notes.filter(note => note && Number.isFinite(note.pitchMidi) &&
+    Number.isFinite(note.startTimeSeconds) && note.startTimeSeconds >= 0 &&
+    Number.isFinite(note.durationSeconds) && note.durationSeconds > 0 &&
+    Number.isFinite(note.startTimeSeconds + note.durationSeconds) &&
+    note.startTimeSeconds + note.durationSeconds > note.startTimeSeconds).map(note => {
+    let pitch = Math.round(note.pitchMidi);
+    // Fold in constant time, including unusually large pitches from direct callers.
+    if (pitch < 21) pitch = 21 + ((pitch - 21) % 12 + 12) % 12;
+    if (pitch > 108) pitch = 97 + ((pitch - 97) % 12 + 12) % 12;
     return {
       pitch,
       startTimeSeconds: note.startTimeSeconds,
       end: note.startTimeSeconds + note.durationSeconds,
-      amplitude: note.amplitude,
-      onset: note.onset,
+      amplitude: Number.isFinite(note.amplitude) ? note.amplitude : 0.5,
+      onset: Number.isFinite(note.onset) ? note.onset : undefined,
     };
   }).sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
 

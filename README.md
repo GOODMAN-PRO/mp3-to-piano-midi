@@ -1,66 +1,70 @@
 # MP3 to Piano MIDI
 
-A small, browser-only converter for MP3 or any browser-decodable audio. Spotify Basic Pitch transcribes notes locally; the app folds them into the 88-key piano range, merges overlapping notes of the same pitch, and exports piano MIDI without pitch bends. Audio is never uploaded. Transcription is approximate, especially for full mixes.
+A browser-only MP3/audio converter using Spotify Basic Pitch. Audio stays on your device. The result is an approximate piano arrangement, especially for full mixes; it is not a score transcription. Exports use the 88-key range, piano instruments, no pitch bends, and a 120 BPM tempo event while preserving timing in seconds.
 
 ## Run
 
-Run `npm install` once (the Basic Pitch model files are already in `public/model`).
+Use Node 24. Install dependencies with `npm ci --cache G:\Temp\npm-cache` on this Windows machine; its default npm cache is broken. The model is already in `public/model`.
 
 ```sh
 npm run dev
-npm run build
+npm test
+npx vite build
 ```
 
-Open the local URL printed by Vite. The build creates `dist/`, ready for static hosting, including GitHub Pages under a sub-path. Open a served page rather than an HTML file directly. Run `npm test` for the piano-note self-check.
+Open the URL printed by Vite, choose audio, press **Convert**, then **Download MIDI**. Serve the page over HTTP rather than opening HTML directly. `dist/` is the static build; `.github/workflows/pages.yml` deploys it to GitHub Pages on pushes to `main`.
 
 ## Controls
 
-- **Sensitivity:** onset threshold; lower values detect more note starts, higher values require stronger starts.
-- **Note threshold:** frame threshold; lower values retain quieter note sustain.
-- **Arrangement:** Full keeps the chord arrangement. Easy (melody + bass) keeps the highest right-hand note and lowest left-hand note in each 30 ms group, then drops notes shorter than 120 ms before smoothing.
-- **Min note length (ms):** filters short detections (default 80 ms).
-- **Max simultaneous notes:** keeps the loudest playable notes in each original group starting within 30 ms (default 6), after hand assignment. Sustained notes from earlier groups can still overlap.
-- **Split hands (automatic):** two piano tracks, using the song's median pitch (clamped to MIDI 48–72) as the preferred split and adjusting each chord so each hand spans at most 14 semitones and plays at most five notes. Chords that cannot fit lose the quietest notes in the offending hand; uncheck for one piano track with the same playability limits.
-- **Note-length smoothing:** isolated short notes are extended to 120 ms, and single-note attacks within a hand join across gaps up to 100 ms (150 ms in Easy). Gap-fill adds at most 150 ms per note and preserves the releases of chords within a hand and same-pitch re-strikes.
+Automatic controls below are configurable through the CLI; the browser exposes the first six rows.
 
-Weak-onset fragments of the same pitch are joined across gaps of up to 80 ms before chord limiting. Starts with an onset strength of 0.65 or greater stay separate, preserving stronger repeated notes; overlapping notes still merge as before. This reduces false re-attacks in full mixes, though transcription remains approximate.
+| Control | What it does | Default |
+| --- | --- | --- |
+| Arrangement / `--preset` | Full keeps chords; Easy keeps the highest right-hand and lowest left-hand note per group, then drops notes shorter than 120 ms. | `full` |
+| Sensitivity / `--onset` | Onset threshold. Lower detects more attacks. | `0.5` |
+| Note threshold / `--frame` | Frame threshold. Lower retains quieter sustain. | `0.3` |
+| Min note length / `--min` | Minimum detection length, in milliseconds. | `80` |
+| Max simultaneous notes / `--poly` | Keeps the loudest playable notes per original 30 ms attack group. | `6` |
+| Split hands / `--no-split` | Writes two piano tracks; disabling writes one without changing the arrangement. | On, automatic |
+| `--split-at` | Preferred hand boundary: `0` uses the median pitch clamped to MIDI 48–72; otherwise fixes the preferred pitch. | `0` |
+| `--tolerance` | Consecutive low-energy model frames tolerated during sustain (one frame ≈11.6 ms). | `11` |
+| `--legato` | Joins same-pitch fragments across gaps ≤80 ms when the later onset is weaker than this threshold. | `0.7` |
+| `--harmonic` | Removes quieter +12/+19/+24 overtones with starts within 30 ms and ≥60% duration overlap; value is their amplitude ratio to the lower note. | `0.6` |
+| `--align` | Aligns attacks within this many milliseconds, preserving endings where possible (1 ms minimum) and same-pitch re-strikes. | `30` |
+| `--ghost` | Removes notes shorter than 150 ms below this fraction of the median amplitude within ±1 second. | `0.35` |
+| Dynamics / `--no-dynamics` | Maps amplitude percentiles 5–95 to velocities 0.35–0.95, clamped to 0.1–1; constant amplitudes use 0.7. | On |
+| `--min-sounding` | Extends isolated short notes to this length, in milliseconds. | `120` |
+| `--legato-gap` | Fills gaps between single-note attacks in one hand, adding at most 150 ms per note. | `100`; Easy `150` |
 
-Automatic harmonic cleanup removes much quieter overtones sharing a start and most of their duration with a lower note, while keeping strong octave doublings.
+Set `--legato`, `--harmonic`, `--align`, `--ghost`, `--min-sounding`, or `--legato-gap` to `0` to disable that stage. `--no-dynamics` restores raw amplitudes clamped to 0.05–1.
 
-Chords are aligned within 30 ms while preserving note endings and separate same-pitch re-strikes; velocities expand the conversion's 5th–95th amplitude percentiles to 0.35–0.95. Short notes below 35% of their local median amplitude are removed, so uniformly soft passages are preserved.
+Each hand is limited to five notes spanning 14 semitones per 30 ms attack group. The boundary may move away from the preferred split; impossible chords lose the quietest offending notes. These are attack-group limits: sustained notes from earlier groups can still exceed the total cap or a hand's reach.
 
-Choose a file, press **Convert**, then **Download MIDI**. The download keeps the original filename with a `.mid` extension.
+A short note is isolated when no same-pitch note starts within 120 ms after its end. Extensions stop at least 1 ms before the next same-pitch note and are skipped if they would create an additional ≤50 ms fragment pair. Multi-note attacks within a hand skip gap-fill. Strong repeated notes stay separate; stronger fragment merging can also join some genuine softer re-strikes.
 
 ## Command line
 
-Use Node 24 with **ffmpeg on PATH** and the project's dependencies installed:
+Requires **ffmpeg on PATH** and Node 24:
 
 ```sh
 node cli.mjs "song.mp3" --out "song.mid" --json
 node cli.mjs "song.mp3" --out "song-easy.mid" --preset easy --json
+node cli.mjs --help
 ```
 
-The CLI uses the same extraction, smoothing, and MIDI code as the browser. It decodes to mono 22050 Hz, loads `public/model` locally, and runs inference on the CPU. The first run can take several minutes; model outputs are saved in `.cache/` so changing parameters skips inference. Cache entries are checked against the source path, size, modification time, and model timestamp. Delete the corresponding cache file to force inference again.
+Without `--out`, the MIDI is written beside the input. CPU inference can take several minutes. Model outputs are cached in `.cache/` by basename and size, checked against source path/mtime and model timestamp; parameter changes reuse inference. Delete the matching cache to force inference. Decoding is limited to 256 MiB of mono 22050 Hz float audio (about 50 minutes); split longer files first.
 
-Options: `--onset`, `--frame`, `--min` (milliseconds), `--poly`, `--tolerance` (model frames), `--legato` (weak-onset threshold; `0` disables fragment smoothing), `--harmonic` (amplitude ratio; `0` disables harmonic cleanup), `--align` (milliseconds within a chord group; `0` disables), `--ghost` (local amplitude ratio; `0` disables), `--split-at` (`0` for automatic, otherwise a fixed preferred MIDI pitch from 1–127), `--preset` (`full` or `easy`), `--min-sounding` and `--legato-gap` (milliseconds; `0` disables each length-smoothing stage), `--no-dynamics`, and `--no-split`. Run `node cli.mjs --help` for defaults. Without `--out`, MIDI is written beside the input with a `.mid` extension.
+`--json` writes one statistics object to stdout; progress goes to stderr. Statistics describe notes before MIDI tick/velocity quantization. Fragments count same-pitch pairs with gaps ≤50 ms, including genuine repeats. Chord spread and hand violations use 30 ms groups anchored at the first note. Peak sounding counts all overlapping sustains. `harmonicPairsWeak` uses amplitude ratio 0.6 and `quietShortNotes` uses 0.35 regardless of cleanup settings. Duration percentiles are in milliseconds; velocity percentiles are in 0–1 units.
 
-Browser and CLI defaults are onset `0.5`, frame `0.3`, minimum `80` ms, polyphony `6`, energy tolerance `11` frames, legato `0.65`, harmonic `0.6`, alignment `30` ms, ghost ratio `0.35`, automatic split (`--split-at 0`), Full arrangement, minimum sounding length `120` ms, legato gap `100` ms, dynamics and split hands enabled. Easy defaults to a `150` ms legato gap unless explicitly overridden. Harmonic cleanup considers notes 12, 19, or 24 semitones above a louder note, with starts within 30 ms and at least 60% duration overlap.
+## Code map
 
-Alignment uses the earliest chord start that does not overlap a previous note of the same pitch, preserving original ends with a minimum duration of 1 ms. Dynamics uses one linear percentile mapping clamped to 0.1–1, or 0.7 when the percentile range is constant; `--no-dynamics` restores the raw amplitude clamp. Quiet cleanup compares notes shorter than 150 ms against the median raw amplitude of notes starting within ±1 second, before alignment and velocity mapping. Use `--align 0 --ghost 0 --no-dynamics` to disable these three stages.
+`main.js` decodes/resamples browser audio and lazily reuses one model, with TensorFlow scopes and a WebGL-to-CPU fallback. `cli.mjs` provides ffmpeg decoding, local model loading, inference caching, and statistics. Both use the same three modules:
 
-Hand assignment follows cleanup and alignment, before the total chord cap. A forced split fixes the preferred pitch rather than disabling hand limits: notes below it favour the left hand, notes at or above it favour the right, and a chord's boundary can move to fit both hands. These limits apply to 30 ms attack groups; sustained notes from earlier groups can still exceed a hand's reach or finger count.
+- `extract.js`: model frames/onsets → timed notes; subtracts one frame from Basic Pitch's exclusive minimum-length cutoff and labels onset-less continuations with zero onset.
+- `piano.js`: range folding → overlap/fragment merge → harmonic/quiet cleanup → chord alignment → hand assignment and arrangement → chord cap → length smoothing → dynamics. It does not mutate inputs; array metadata carries `splitPoint` and `playabilityDrops`.
+- `midi.js`: hand-labelled notes → explicit ticks at 120 BPM. Same-tick same-pitch attacks coalesce, and earlier notes are clipped at later re-strikes so exports have positive lengths and no same-pitch overlaps, even across tracks.
 
-Length smoothing follows arrangement selection and leaves all note starts unchanged. A short note is isolated when no same-pitch note starts within 120 ms after its original end. Extensions stop at least 1 ms before the next same-pitch note, and are skipped if they would turn a gap above 50 ms into an additional fragment pair. Multi-note attacks within a hand skip gap-fill; isolated short chord tones can still receive the minimum sounding length. `--preset full --min-sounding 0 --legato-gap 0` restores loop-3 output; Easy's 120 ms short-note filter remains active when smoothing is disabled.
-
-Statistics include note count, last note end in seconds, notes/second, median duration, percentage under 100 ms, same-pitch pairs separated by at most 50 ms, their later notes' mean onset strength, and peak sounding notes. Strong repeated notes also count in the fragment statistic. `--json` prints one JSON object to stdout; progress goes to stderr.
-
-`harmonicPairs` counts upper notes with a note 12, 19, or 24 semitones below starting within 30 ms; `harmonicPairsWeak` counts those below 0.6 times a qualifying lower note's raw amplitude, regardless of duration overlap.
-
-`chordGroups` counts groups of at least two notes starting within 30 ms of the first note, and `meanChordSpreadMs` measures their average start spread. `velocityP5`, `velocityP50`, and `velocityP95` describe final velocities before MIDI quantization; `quietShortNotes` counts remaining notes shorter than 150 ms and below 0.35 times their local median raw amplitude.
-
-`leftNotes` and `rightNotes` count final hand assignments; `splitPoint` reports the preferred pitch used. `handSpanViolations` and `handPolyViolations` count final 30 ms groups where either hand exceeds 14 semitones or five notes, respectively. `playabilityDrops` counts notes removed by hand limits, separately from the total chord cap; `--no-split` changes only the number of MIDI tracks.
-
-`isolatedShortNotes` counts notes shorter than 120 ms with no same-pitch start within 120 ms after their end. `sameHandGapsUnder100ms` counts gaps of 1–100 ms between consecutive notes ordered by start within each hand. `durationP10`, `durationP50`, `durationP90`, and `maxDurationMs` report final note lengths in milliseconds.
+`test/piano.test.mjs` checks the shared pipeline, MIDI round trips, browser option passing, and edge cases. When changing defaults, update module arguments, CLI defaults, and corresponding HTML values together. TensorFlow is overridden to 4.22 in `package.json` because 3.21 had a WebGL concat-shader failure. No server is needed in production.
 
 ## Getting the MIDI onto a Meta Quest 3
 

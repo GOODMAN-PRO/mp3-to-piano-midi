@@ -102,7 +102,7 @@ form.addEventListener('submit', async event => {
     try {
       await transcribe();
     } catch (error) {
-      // ponytail: some GPUs/browsers fail to compile TF.js WebGL shaders; CPU is slow but works everywhere.
+      // Some GPUs/browsers fail to compile TF.js WebGL shaders; CPU is slow but works everywhere.
       if (tf.getBackend() === 'cpu') throw error;
       console.warn('WebGL inference failed, retrying on CPU', error);
       frames.length = onsets.length = 0;
@@ -111,10 +111,10 @@ form.addEventListener('submit', async event => {
     }
 
     status.textContent = 'Creating piano MIDI…';
+    failureMessage = 'Could not create the MIDI file. Try converting again.';
     const notes = extractNotes(frames, onsets, { onsetThresh, frameThresh, minMs });
     const piano = toPianoNotes(notes, { maxPoly, preset });
 
-    failureMessage = 'Could not create the MIDI file. Try converting again.';
     const blob = new Blob([notesToMidi(piano, { splitHands })], { type: 'audio/midi' });
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     downloadUrl = URL.createObjectURL(blob);
@@ -124,7 +124,9 @@ form.addEventListener('submit', async event => {
     const duration = piano.reduce((end, note) => Math.max(end, note.startTimeSeconds + note.durationSeconds), 0);
     summary.textContent = `${piano.length} notes · ${duration.toFixed(1)} seconds`;
     progress.value = 1;
-    status.textContent = piano.length ? 'Done. Your MIDI is ready.' : 'No notes detected. Try lowering the thresholds.';
+    status.textContent = piano.length ? 'Done. Your MIDI is ready.'
+      : preset === 'easy' ? 'No notes remain in Easy. Try Full or lower the thresholds.'
+        : 'No notes remain. Try lowering the thresholds.';
   } catch (error) {
     console.error(error);
     status.textContent = failureMessage;

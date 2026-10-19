@@ -9,7 +9,7 @@ import { toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
-export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.65, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0, minSounding: 120, legatoGap: 100, preset: 'full' };
+export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.7, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0, minSounding: 120, legatoGap: 100, preset: 'full' };
 
 export function noteStats(notes) {
   const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
@@ -103,7 +103,7 @@ export function noteStats(notes) {
     maxDurationMs: durations.at(-1) ?? 0,
     isolatedShortNotes,
     sameHandGapsUnder100ms,
-    pctUnder100ms: notes.length ? 100 * durations.filter(ms => ms < 100).length / notes.length : 0,
+    pctUnder100ms: notes.length ? 100 * durations.filter(ms => ms < 100 - 1e-6).length / notes.length : 0,
     fragments,
     harmonicPairs,
     harmonicPairsWeak,
@@ -145,6 +145,7 @@ async function modelOutput(input) {
     maxBuffer: 256 * 1024 * 1024,
     windowsHide: true,
   });
+  if (decoded.error?.code === 'ENOBUFS') throw new Error('Audio exceeds the 256 MiB decode limit (about 50 minutes). Split it into shorter files.');
   if (decoded.error) throw new Error(`ffmpeg failed (is it on PATH?): ${decoded.error.message}`);
   if (decoded.status !== 0) throw new Error(`ffmpeg failed: ${decoded.stderr.toString().trim()}`);
   if (!decoded.stdout.length || decoded.stdout.length % 4) throw new Error('ffmpeg returned no usable float32 audio.');
