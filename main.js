@@ -1,7 +1,8 @@
-import { BasicPitch, noteFramesToTime, outputToNotesPoly } from '@spotify/basic-pitch';
+import { BasicPitch } from '@spotify/basic-pitch';
 import * as tf from '@tensorflow/tfjs';
-import { Midi } from '@tonejs/midi';
+import { extractNotes } from './extract.js';
 import { toPianoNotes } from './piano.js';
+import { notesToMidi } from './midi.js';
 
 const form = document.querySelector('#form');
 const fileInput = document.querySelector('#file');
@@ -109,35 +110,18 @@ form.addEventListener('submit', async event => {
     }
 
     status.textContent = 'Creating piano MIDI…';
-    // basic-pitch drops notes with durationFrames <= minNoteLen, so pass one less than the frame count we want to keep.
-    const minNoteLenFrames = Math.max(0, Math.ceil(minMs / (256 / 22050 * 1000)) - 1);
-    const notes = frames.length ? noteFramesToTime(outputToNotesPoly(frames, onsets, onsetThresh, frameThresh, minNoteLenFrames)) : [];
+    const notes = extractNotes(frames, onsets, { onsetThresh, frameThresh, minMs });
     const piano = toPianoNotes(notes, { maxPoly });
 
     failureMessage = 'Could not create the MIDI file. Try converting again.';
-    const midi = new Midi();
-    midi.header.setTempo(120);
-    const tracks = (splitHands ? ['Left hand', 'Right hand'] : ['Piano']).map(name => {
-      const track = midi.addTrack();
-      track.name = name;
-      track.instrument.number = 0;
-      return track;
-    });
-    for (const { pitch, startTimeSeconds, durationSeconds, velocity } of piano) {
-      const track = tracks[splitHands && pitch >= 60 ? 1 : 0];
-      // Round start and end to ticks independently so touching same-pitch notes never overlap by a tick.
-      const ticks = midi.header.secondsToTicks(startTimeSeconds);
-      const durationTicks = Math.max(1, midi.header.secondsToTicks(startTimeSeconds + durationSeconds) - ticks);
-      track.addNote({ midi: pitch, ticks, durationTicks, velocity });
-    }
-
-    const blob = new Blob([midi.toArray()], { type: 'audio/midi' });
+    const blob = new Blob([notesToMidi(piano, { splitHands })], { type: 'audio/midi' });
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     downloadUrl = URL.createObjectURL(blob);
     download.href = downloadUrl;
     download.download = `${file.name.replace(/\.[^.]+$/, '')}.mid`;
     download.hidden = false;
-    summary.textContent = `${piano.length} notes · ${midi.duration.toFixed(1)} seconds`;
+    const duration = piano.reduce((end, note) => Math.max(end, note.startTimeSeconds + note.durationSeconds), 0);
+    summary.textContent = `${piano.length} notes · ${duration.toFixed(1)} seconds`;
     progress.value = 1;
     status.textContent = piano.length ? 'Done. Your MIDI is ready.' : 'No notes detected. Try lowering the thresholds.';
   } catch (error) {
