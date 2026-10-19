@@ -12,8 +12,9 @@ export function notesToMidi(pianoNotes, { splitHands = true } = {}) {
     track.instrument.number = 0;
     return track;
   });
-  for (const { pitch, startTimeSeconds, durationSeconds, velocity } of pianoNotes) {
-    const track = tracks[splitHands && pitch >= 60 ? 1 : 0];
+  for (const { pitch, hand, startTimeSeconds, durationSeconds, velocity } of pianoNotes) {
+    const right = hand === 'right' || hand !== 'left' && pitch >= 60;
+    const track = tracks[splitHands && right ? 1 : 0];
     // Round start and end independently so touching same-pitch notes never overlap by a tick.
     const ticks = midi.header.secondsToTicks(startTimeSeconds);
     const durationTicks = Math.max(1, midi.header.secondsToTicks(startTimeSeconds + durationSeconds) - ticks);

@@ -18,8 +18,8 @@ Open the local URL printed by Vite. The build creates `dist/`, ready for static 
 - **Sensitivity:** onset threshold; lower values detect more note starts, higher values require stronger starts.
 - **Note threshold:** frame threshold; lower values retain quieter note sustain.
 - **Min note length (ms):** filters short detections (default 80 ms).
-- **Max simultaneous notes:** keeps the loudest notes in each group starting within 30 ms (default 6). Sustained notes from earlier groups can still overlap.
-- **Split hands at middle C:** two piano tracks, left below MIDI 60 and right at MIDI 60 or above. Uncheck for one piano track.
+- **Max simultaneous notes:** keeps the loudest playable notes in each original group starting within 30 ms (default 6), after hand assignment. Sustained notes from earlier groups can still overlap.
+- **Split hands (automatic):** two piano tracks, using the song's median pitch (clamped to MIDI 48–72) as the preferred split and adjusting each chord so each hand spans at most 14 semitones and plays at most five notes. Chords that cannot fit lose the quietest notes in the offending hand; uncheck for one piano track with the same playability limits.
 
 Weak-onset fragments of the same pitch are joined across gaps of up to 80 ms before chord limiting. Starts with an onset strength of 0.65 or greater stay separate, preserving stronger repeated notes; overlapping notes still merge as before. This reduces false re-attacks in full mixes, though transcription remains approximate.
 
@@ -39,17 +39,21 @@ node cli.mjs "song.mp3" --out "song.mid" --json
 
 The CLI uses the same extraction, smoothing, and MIDI code as the browser. It decodes to mono 22050 Hz, loads `public/model` locally, and runs inference on the CPU. The first run can take several minutes; model outputs are saved in `.cache/` so changing parameters skips inference. Cache entries are checked against the source path, size, modification time, and model timestamp. Delete the corresponding cache file to force inference again.
 
-Options: `--onset`, `--frame`, `--min` (milliseconds), `--poly`, `--tolerance` (model frames), `--legato` (weak-onset threshold; `0` disables fragment smoothing), `--harmonic` (amplitude ratio; `0` disables harmonic cleanup), `--align` (milliseconds within a chord group; `0` disables), `--ghost` (local amplitude ratio; `0` disables), `--no-dynamics`, and `--no-split`. Run `node cli.mjs --help` for defaults. Without `--out`, MIDI is written beside the input with a `.mid` extension.
+Options: `--onset`, `--frame`, `--min` (milliseconds), `--poly`, `--tolerance` (model frames), `--legato` (weak-onset threshold; `0` disables fragment smoothing), `--harmonic` (amplitude ratio; `0` disables harmonic cleanup), `--align` (milliseconds within a chord group; `0` disables), `--ghost` (local amplitude ratio; `0` disables), `--split-at` (`0` for automatic, otherwise a fixed preferred MIDI pitch from 1–127), `--no-dynamics`, and `--no-split`. Run `node cli.mjs --help` for defaults. Without `--out`, MIDI is written beside the input with a `.mid` extension.
 
-Browser and CLI defaults are onset `0.5`, frame `0.3`, minimum `80` ms, polyphony `6`, energy tolerance `11` frames, legato `0.65`, harmonic `0.6`, alignment `30` ms, ghost ratio `0.35`, dynamics and split hands enabled. Harmonic cleanup considers notes 12, 19, or 24 semitones above a louder note, with starts within 30 ms and at least 60% duration overlap. For the original behaviour, use `--min 60 --legato 0 --harmonic 0 --align 0 --ghost 0 --no-dynamics`.
+Browser and CLI defaults are onset `0.5`, frame `0.3`, minimum `80` ms, polyphony `6`, energy tolerance `11` frames, legato `0.65`, harmonic `0.6`, alignment `30` ms, ghost ratio `0.35`, automatic split (`--split-at 0`), dynamics and split hands enabled. Harmonic cleanup considers notes 12, 19, or 24 semitones above a louder note, with starts within 30 ms and at least 60% duration overlap.
 
-Alignment uses the earliest chord start that does not overlap a previous note of the same pitch, preserving original ends with a minimum duration of 1 ms. Dynamics uses one linear percentile mapping clamped to 0.1–1, or 0.7 when the percentile range is constant; `--no-dynamics` restores the raw amplitude clamp. Quiet cleanup compares notes shorter than 150 ms against the median raw amplitude of notes starting within ±1 second, before alignment and velocity mapping. Use `--align 0 --ghost 0 --no-dynamics` to restore the loop-1 processing.
+Alignment uses the earliest chord start that does not overlap a previous note of the same pitch, preserving original ends with a minimum duration of 1 ms. Dynamics uses one linear percentile mapping clamped to 0.1–1, or 0.7 when the percentile range is constant; `--no-dynamics` restores the raw amplitude clamp. Quiet cleanup compares notes shorter than 150 ms against the median raw amplitude of notes starting within ±1 second, before alignment and velocity mapping. Use `--align 0 --ghost 0 --no-dynamics` to disable these three stages.
+
+Hand assignment follows cleanup and alignment, before the total chord cap. A forced split fixes the preferred pitch rather than disabling hand limits: notes below it favour the left hand, notes at or above it favour the right, and a chord's boundary can move to fit both hands. These limits apply to 30 ms attack groups; sustained notes from earlier groups can still exceed a hand's reach or finger count.
 
 Statistics include note count, last note end in seconds, notes/second, median duration, percentage under 100 ms, same-pitch pairs separated by at most 50 ms, their later notes' mean onset strength, and peak sounding notes. Strong repeated notes also count in the fragment statistic. `--json` prints one JSON object to stdout; progress goes to stderr.
 
 `harmonicPairs` counts upper notes with a note 12, 19, or 24 semitones below starting within 30 ms; `harmonicPairsWeak` counts those below 0.6 times a qualifying lower note's raw amplitude, regardless of duration overlap.
 
 `chordGroups` counts groups of at least two notes starting within 30 ms of the first note, and `meanChordSpreadMs` measures their average start spread. `velocityP5`, `velocityP50`, and `velocityP95` describe final velocities before MIDI quantization; `quietShortNotes` counts remaining notes shorter than 150 ms and below 0.35 times their local median raw amplitude.
+
+`leftNotes` and `rightNotes` count final hand assignments; `splitPoint` reports the preferred pitch used. `handSpanViolations` and `handPolyViolations` count final 30 ms groups where either hand exceeds 14 semitones or five notes, respectively. `playabilityDrops` counts notes removed by hand limits, separately from the total chord cap; `--no-split` changes only the number of MIDI tracks.
 
 ## Getting the MIDI onto a Meta Quest 3
 

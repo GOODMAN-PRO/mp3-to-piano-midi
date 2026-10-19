@@ -9,7 +9,8 @@ const note = (pitchMidi, startTimeSeconds = 0, durationSeconds = 1, amplitude = 
   ({ pitchMidi, startTimeSeconds, durationSeconds, amplitude });
 // Keep the original processing assertions isolated from the new optional stages.
 const toPianoNotes = (notes, options = {}) =>
-  pianoWithDefaults(notes, { align: 0, dynamics: false, ghost: 0, ...options });
+  pianoWithDefaults(notes, { align: 0, dynamics: false, ghost: 0, ...options })
+    .map(({ hand, ...note }) => note);
 
 assert.equal(toPianoNotes([note(10)])[0].pitch, 22);
 assert.equal(toPianoNotes([note(120)])[0].pitch, 108);
@@ -147,6 +148,56 @@ const cleanedDynamics = pianoWithDefaults(localDynamics, { ghost: 0.35 });
 assert.deepEqual(cleanedDynamics.map(n => n.startTimeSeconds), [0.2, 0.4, 0.6, 0.8, 10, 10.2, 10.4]);
 assert.equal(pianoWithDefaults(localDynamics, { ghost: 0 }).length, localDynamics.length);
 
+// Choose the split from the conversion's pitch median, with a bounded register.
+const separated = pitches => pitches.map((pitch, i) => note(pitch, i * 2));
+assert.equal(pianoWithDefaults(separated([30, 36, 40])).splitPoint, 48);
+assert.equal(pianoWithDefaults(separated([80, 84, 88])).splitPoint, 72);
+assert.equal(pianoWithDefaults(separated([58, 61])).splitPoint, 59.5);
+assert.equal(pianoWithDefaults([]).splitPoint, 60);
+const fixedHands = pianoWithDefaults(separated([67, 72, 76]), { splitAt: 72 });
+assert.equal(fixedHands.splitPoint, 72);
+assert.deepEqual(fixedHands.map(n => n.hand), ['left', 'right', 'right']);
+const fitsHands = notes => {
+  for (const hand of ['left', 'right']) {
+    const pitches = notes.filter(n => n.hand === hand).map(n => n.pitch);
+    assert.ok(pitches.length <= 5);
+    if (pitches.length) assert.ok(Math.max(...pitches) - Math.min(...pitches) <= 14);
+  }
+};
+const twoOctaves = pianoWithDefaults([48, 52, 55, 60, 64, 67, 72].map(p => note(p)), { maxPoly: 7 });
+assert.equal(twoOctaves.length, 7);
+assert.equal(twoOctaves.playabilityDrops, 0);
+assert.ok(twoOctaves.some(n => n.hand === 'left') && twoOctaves.some(n => n.hand === 'right'));
+fitsHands(twoOctaves);
+// A forced split is the preferred boundary; a feasible chord division still wins.
+const shiftedBoundary = pianoWithDefaults([48, 50, 52, 54, 56, 58, 60].map(p => note(p)),
+  { maxPoly: 7, splitAt: 72 });
+assert.equal(shiftedBoundary.splitPoint, 72);
+assert.equal(shiftedBoundary.length, 7);
+assert.equal(shiftedBoundary.playabilityDrops, 0);
+fitsHands(shiftedBoundary);
+const impossibleChord = pianoWithDefaults([
+  note(24, 0, 1, 0.9), note(60, 0, 1, 0.8), note(100, 0, 1, 0.1),
+], { harmonic: 0 });
+assert.deepEqual(impossibleChord.map(n => n.pitch), [24, 60]);
+assert.equal(impossibleChord.playabilityDrops, 1);
+fitsHands(impossibleChord);
+// Assign hands before the total cap: retain quiet bass, drop the weakest of six upper notes.
+const beforeTotalCap = pianoWithDefaults([
+  note(48, 0, 1, 0.1), ...[72, 73, 74, 75, 76, 77].map((pitch, i) => note(pitch, 0, 1, 0.5 + i / 10)),
+], { splitAt: 60, maxPoly: 6, harmonic: 0 });
+assert.deepEqual(beforeTotalCap.map(n => n.pitch).sort((a, b) => a - b), [48, 73, 74, 75, 76, 77]);
+assert.equal(beforeTotalCap.playabilityDrops, 1);
+fitsHands(beforeTotalCap);
+// Dropping an early cap candidate changes the final 30 ms group; reassign its hands.
+const shiftedAnchor = pianoWithDefaults([
+  note(36, 0, 0.3, 0.1), note(48, 0.02, 0.3, 0.8), note(24, 0.04, 0.3, 0.8),
+], { align: 0, maxPoly: 1, splitAt: 60, harmonic: 0, ghost: 0, legato: 0 });
+assert.deepEqual(shiftedAnchor.map(n => [n.pitch, n.hand]), [[48, 'right'], [24, 'left']]);
+assert.equal(shiftedAnchor.playabilityDrops, 0);
+assert.equal(noteStats(shiftedAnchor).handSpanViolations, 0);
+assert.equal(noteStats(shiftedAnchor).handPolyViolations, 0);
+
 assert.deepEqual(extractNotes([], []), []);
 const frames = Array.from({ length: 35 }, (_, i) =>
   Array.from({ length: 88 }, (_, pitch) => pitch === 39 && i >= 4 && i < 24 ? 0.7 : 0));
@@ -196,12 +247,23 @@ const singleTrack = new midiPackage.Midi(notesToMidi(midiNotes, { splitHands: fa
 assert.equal(singleTrack.tracks.length, 1);
 assert.equal(singleTrack.tracks[0].name, 'Piano');
 assert.equal(singleTrack.tracks[0].notes.length, 3);
+const labelledMidi = new midiPackage.Midi(notesToMidi([
+  { ...midiNotes[0], pitch: 75, hand: 'left' },
+  { ...midiNotes[2], pitch: 45, hand: 'right' },
+]));
+assert.deepEqual(labelledMidi.tracks.map(track => track.notes.map(n => n.midi)), [[75], [45]]);
+const labelledSingleTrack = new midiPackage.Midi(notesToMidi([
+  { ...midiNotes[0], hand: 'right' }, { ...midiNotes[2], hand: 'left' },
+], { splitHands: false }));
+assert.equal(labelledSingleTrack.tracks.length, 1);
+assert.equal(labelledSingleTrack.tracks[0].notes.length, 2);
 
 assert.deepEqual(noteStats([]), {
   notes: 0, seconds: 0, notesPerSec: 0, medianDurationMs: 0, pctUnder100ms: 0,
   fragments: 0, meanOnsetAtFragmentStart: 0, maxSoundingAtOnce: 0,
   harmonicPairs: 0, harmonicPairsWeak: 0,
   chordGroups: 0, meanChordSpreadMs: 0, velocityP5: 0, velocityP50: 0, velocityP95: 0, quietShortNotes: 0,
+  leftNotes: 0, rightNotes: 0, handSpanViolations: 0, handPolyViolations: 0, splitPoint: 60, playabilityDrops: 0,
 });
 const measuredNotes = [
   { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.08, onset: 0.9 },
@@ -258,5 +320,27 @@ assert.equal(noteStats([
   { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.1, amplitude: 0.1, velocity: 0.7 },
   { pitch: 64, startTimeSeconds: 1, durationSeconds: 0.2, amplitude: 0.8, velocity: 0.7 },
 ]).quietShortNotes, 1); // Include the ±1 s boundary and measure raw amplitude rather than velocity.
+
+const handStatsNotes = Object.assign([
+  ...[30, 46].map(pitch => ({ pitch, hand: 'left', startTimeSeconds: 0, durationSeconds: 0.2 })),
+  ...[60, 76].map(pitch => ({ pitch, hand: 'right', startTimeSeconds: 0.02, durationSeconds: 0.2 })),
+  ...Array.from({ length: 6 }, (_, i) => ({ pitch: 30 + i, hand: 'left', startTimeSeconds: 1, durationSeconds: 0.2 })),
+  ...Array.from({ length: 6 }, (_, i) => ({ pitch: 60 + i, hand: 'right', startTimeSeconds: 1, durationSeconds: 0.2 })),
+], { splitPoint: 57.5, playabilityDrops: 3 });
+const handStats = noteStats(handStatsNotes);
+assert.equal(handStats.leftNotes, 8);
+assert.equal(handStats.rightNotes, 8);
+assert.equal(handStats.handSpanViolations, 1); // Count a group once even when both hands violate.
+assert.equal(handStats.handPolyViolations, 1);
+assert.equal(handStats.splitPoint, 57.5);
+assert.equal(handStats.playabilityDrops, 3);
+const explicitHandStats = noteStats([
+  { pitch: 80, hand: 'left', startTimeSeconds: 0, durationSeconds: 1 },
+  { pitch: 40, hand: 'right', startTimeSeconds: 2, durationSeconds: 1 },
+  { pitch: 59, startTimeSeconds: 4, durationSeconds: 1 },
+  { pitch: 60, startTimeSeconds: 6, durationSeconds: 1 },
+]);
+assert.equal(explicitHandStats.leftNotes, 2);
+assert.equal(explicitHandStats.rightNotes, 2);
 
 console.log('piano, extraction, MIDI, and statistics tests passed');

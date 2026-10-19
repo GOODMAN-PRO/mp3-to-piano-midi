@@ -9,7 +9,7 @@ import { toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
-export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.65, harmonic: 0.6, align: 30, ghost: 0.35 };
+export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.65, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0 };
 
 export function noteStats(notes) {
   const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
@@ -23,6 +23,8 @@ export function noteStats(notes) {
     return values[lo] + (values[hi] - values[lo]) * (index - lo);
   };
   let chordGroups = 0, chordSpread = 0, quietShortNotes = 0, firstLocal = 0, lastLocal = 0;
+  const handOf = note => note.hand ?? (note.pitch >= 60 ? 'right' : 'left');
+  let handSpanViolations = 0, handPolyViolations = 0;
   for (let i = 0; i < sorted.length;) {
     let end = i + 1;
     while (end < sorted.length && sorted[end].startTimeSeconds <= sorted[i].startTimeSeconds + 0.03 + 1e-9) end++;
@@ -30,6 +32,10 @@ export function noteStats(notes) {
       chordGroups++;
       chordSpread += (sorted[end - 1].startTimeSeconds - sorted[i].startTimeSeconds) * 1000;
     }
+    const group = sorted.slice(i, end);
+    const hands = ['left', 'right'].map(hand => group.filter(note => handOf(note) === hand).map(note => note.pitch));
+    if (hands.some(pitches => pitches.length && Math.max(...pitches) - Math.min(...pitches) > 14)) handSpanViolations++;
+    if (hands.some(pitches => pitches.length > 5)) handPolyViolations++;
     i = end;
   }
   for (let i = 0; i < sorted.length; i++) {
@@ -86,6 +92,12 @@ export function noteStats(notes) {
     velocityP50: percentile(velocities, 0.5),
     velocityP95: percentile(velocities, 0.95),
     quietShortNotes,
+    leftNotes: sorted.filter(note => handOf(note) === 'left').length,
+    rightNotes: sorted.filter(note => handOf(note) === 'right').length,
+    handSpanViolations,
+    handPolyViolations,
+    splitPoint: notes.splitPoint ?? 60,
+    playabilityDrops: notes.playabilityDrops ?? 0,
     meanOnsetAtFragmentStart: fragments ? onsetSum / fragments : 0,
     maxSoundingAtOnce,
   };
@@ -155,7 +167,7 @@ async function modelOutput(input) {
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes('--help')) {
-    const flags = Object.entries(defaults).map(([key, value]) => `[--${key} ${value}]`).join(' ');
+    const flags = Object.entries(defaults).map(([key, value]) => `[--${key === 'splitAt' ? 'split-at' : key} ${value}]`).join(' ');
     console.log(`Usage: node cli.mjs <audio file> [--out file.mid] ${flags} [--no-dynamics] [--no-split] [--json]`);
     return;
   }
@@ -165,14 +177,14 @@ async function main() {
   let splitHands = true, dynamics = true, json = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+    const key = arg === '--split-at' ? 'splitAt' : arg.slice(2);
     if (arg === '--no-split') splitHands = false;
     else if (arg === '--no-dynamics') dynamics = false;
     else if (arg === '--json') json = true;
     else if (arg === '--out') {
       if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error('--out needs a filename.');
       output = resolve(args[++i]);
-    } else if (arg.startsWith('--') && Object.hasOwn(options, arg.slice(2))) {
-      const key = arg.slice(2);
+    } else if (arg.startsWith('--') && Object.hasOwn(options, key)) {
       const value = Number(args[++i]);
       if (!Number.isFinite(value)) throw new Error(`${arg} needs a finite number.`);
       options[key] = value;
@@ -182,6 +194,7 @@ async function main() {
     if (options[key] < 0 || options[key] > 1) throw new Error(`--${key} must be between 0 and 1.`);
   }
   if (options.align < 0) throw new Error('--align must be nonnegative.');
+  if (!Number.isInteger(options.splitAt) || options.splitAt < 0 || options.splitAt > 127) throw new Error('--split-at must be 0 (automatic) or an integer MIDI pitch from 1 to 127.');
   for (const key of ['min', 'poly', 'tolerance']) {
     if (!Number.isInteger(options[key]) || options[key] < 1) throw new Error(`--${key} must be a positive integer.`);
   }
@@ -193,7 +206,7 @@ async function main() {
   });
   const piano = toPianoNotes(notes, {
     maxPoly: options.poly, legato: options.legato, harmonic: options.harmonic,
-    align: options.align, ghost: options.ghost, dynamics,
+    align: options.align, ghost: options.ghost, dynamics, splitAt: options.splitAt,
   });
   writeFileSync(output, notesToMidi(piano, { splitHands }));
   const stats = { input, output, cacheHit, parameters: { ...options, dynamics, splitHands }, ...noteStats(piano) };

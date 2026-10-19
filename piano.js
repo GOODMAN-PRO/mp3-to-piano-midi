@@ -1,5 +1,5 @@
 export function toPianoNotes(notes, {
-  maxPoly = 6, legato = 0.65, harmonic = 0.6, align = 30, dynamics = true, ghost = 0.35,
+  maxPoly = 6, legato = 0.65, harmonic = 0.6, align = 30, dynamics = true, ghost = 0.35, splitAt = 0,
 } = {}) {
   const sorted = notes.map(note => {
     let pitch = note.pitchMidi;
@@ -54,10 +54,8 @@ export function toPianoNotes(notes, {
     let end = i + 1;
     while (end < merged.length &&
       merged[end].startTimeSeconds - merged[i].startTimeSeconds <= 0.03) end++;
-    // Keep the original chord-group anchors, removing ghosts before they use a cap slot.
-    const group = merged.slice(i, end).filter(note => !ghosts.has(note));
-    group.sort((a, b) => b.amplitude - a.amplitude);
-    chords.push(group.slice(0, maxPoly).sort((a, b) => a.startTimeSeconds - b.startTimeSeconds));
+    // Keep the original chord-group anchors through cleanup and alignment.
+    chords.push(merged.slice(i, end).filter(note => !ghosts.has(note)));
     i = end;
   }
 
@@ -79,7 +77,7 @@ export function toPianoNotes(notes, {
     }
   }
 
-  const kept = [], previousEnds = new Map();
+  const aligned = [], previousEnds = new Map();
   for (const chord of chords) {
     const audible = chord.filter(note => !quiet.has(note));
     for (let i = 0; i < audible.length;) {
@@ -101,16 +99,66 @@ export function toPianoNotes(notes, {
           note.end = Math.max(note.end, start + 0.001);
         }
         previousEnds.set(note.pitch, note.end);
-        kept.push(note);
+        aligned.push(note);
       }
       i = end;
     }
   }
 
+  const pitches = aligned.map(note => note.pitch).sort((a, b) => a - b);
+  const splitPoint = splitAt || Math.min(72, Math.max(48, pitches.length ? percentile(pitches, 0.5) : 60));
+  const violations = hand => Number(hand.length > 5) +
+    Number(hand.length > 1 && hand.at(-1).pitch - hand[0].pitch > 14);
+  aligned.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+  let kept = aligned, previousCount, playabilityDrops = 0;
+  do {
+    previousCount = kept.length;
+    const playable = new Set();
+    for (let i = 0; i < kept.length;) {
+      let end = i + 1;
+      while (end < kept.length && kept[end].startTimeSeconds - kept[i].startTimeSeconds <= 0.03 + 1e-9) end++;
+      const group = kept.slice(i, end).sort((a, b) => a.pitch - b.pitch);
+      const natural = group.filter(note => note.pitch < splitPoint).length;
+      let best;
+      for (let k = 0; k <= group.length; k++) {
+        const count = violations(group.slice(0, k)) + violations(group.slice(k));
+        // Distance to the gap between hands; a valid natural split wins ties.
+        const distance = Math.max(0, (group[k - 1]?.pitch ?? -Infinity) - splitPoint,
+          splitPoint - (group[k]?.pitch ?? Infinity));
+        const shift = Math.abs(k - natural);
+        if (!best || count < best.count || count === best.count &&
+          (distance < best.distance || distance === best.distance && shift < best.shift)) {
+          best = { k, count, distance, shift };
+        }
+      }
+      const hands = [group.slice(0, best.k), group.slice(best.k)];
+      for (let h = 0; h < hands.length; h++) {
+        const hand = hands[h];
+        while (violations(hand)) {
+          let quietest = 0;
+          for (let j = 1; j < hand.length; j++) if (hand[j].amplitude < hand[quietest].amplitude) quietest = j;
+          hand.splice(quietest, 1);
+          playabilityDrops++;
+        }
+        for (const note of hand) {
+          note.hand = h ? 'right' : 'left';
+          playable.add(note);
+        }
+      }
+      i = end;
+    }
+    // Apply the total cap to its original groups, after hand assignment.
+    kept = chords.flatMap(chord => chord.filter(note => playable.has(note))
+      .sort((a, b) => b.amplitude - a.amplitude).slice(0, maxPoly))
+      .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+    // A removed anchor can join neighbouring groups; reassign until no more notes disappear.
+  } while (kept.length < previousCount);
+
   const amplitudes = kept.map(note => note.amplitude).sort((a, b) => a - b);
   const p5 = percentile(amplitudes, 0.05), p95 = percentile(amplitudes, 0.95);
-  return kept.map(note => ({
+  const result = kept.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds).map(note => ({
     pitch: note.pitch,
+    hand: note.hand,
     startTimeSeconds: note.startTimeSeconds,
     durationSeconds: note.end - note.startTimeSeconds,
     amplitude: note.amplitude,
@@ -119,4 +167,5 @@ export function toPianoNotes(notes, {
       : Math.min(1, Math.max(0.05, note.amplitude)),
     ...(note.onset === undefined ? {} : { onset: note.onset }),
   }));
+  return Object.assign(result, { splitPoint, playabilityDrops });
 }
