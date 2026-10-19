@@ -39,6 +39,7 @@ form.addEventListener('submit', async event => {
   const frameThresh = Number(document.querySelector('#threshold').value);
   const minMs = Number(document.querySelector('#min-length').value);
   const maxPoly = Number(document.querySelector('#max-poly').value);
+  const preset = document.querySelector('#preset').value;
   const splitHands = document.querySelector('#split').checked;
   controls.disabled = true;
   convert.disabled = true;
@@ -111,7 +112,7 @@ form.addEventListener('submit', async event => {
 
     status.textContent = 'Creating piano MIDI…';
     const notes = extractNotes(frames, onsets, { onsetThresh, frameThresh, minMs });
-    const piano = toPianoNotes(notes, { maxPoly });
+    const piano = toPianoNotes(notes, { maxPoly, preset });
 
     failureMessage = 'Could not create the MIDI file. Try converting again.';
     const blob = new Blob([notesToMidi(piano, { splitHands })], { type: 'audio/midi' });

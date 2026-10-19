@@ -1,5 +1,6 @@
 export function toPianoNotes(notes, {
   maxPoly = 6, legato = 0.65, harmonic = 0.6, align = 30, dynamics = true, ghost = 0.35, splitAt = 0,
+  preset = 'full', minSounding = 120, legatoGap = preset === 'easy' ? 150 : 100,
 } = {}) {
   const sorted = notes.map(note => {
     let pitch = note.pitchMidi;
@@ -140,8 +141,13 @@ export function toPianoNotes(notes, {
           hand.splice(quietest, 1);
           playabilityDrops++;
         }
-        for (const note of hand) {
+        // Easy keeps the outer voices before the loudness cap, then discards flickers.
+        const arrangement = preset === 'easy'
+          ? [hand.at(h ? -1 : 0)].filter(note => note && note.end - note.startTimeSeconds >= 0.12 - 1e-9)
+          : hand;
+        for (const note of arrangement) {
           note.hand = h ? 'right' : 'left';
+          note.chord = arrangement.length > 1;
           playable.add(note);
         }
       }
@@ -153,6 +159,27 @@ export function toPianoNotes(notes, {
       .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
     // A removed anchor can join neighbouring groups; reassign until no more notes disappear.
   } while (kept.length < previousCount);
+
+  const nextByPitch = new Map(), nextByHand = new Map();
+  for (let i = kept.length - 1; i >= 0; i--) {
+    const note = kept[i], originalEnd = note.end;
+    const nextPitch = nextByPitch.get(note.pitch), nextHand = nextByHand.get(note.hand);
+    const pitchGap = nextPitch ? nextPitch.startTimeSeconds - originalEnd : Infinity;
+    const extendTo = end => {
+      end = Math.max(note.end, Math.min(end, nextPitch ? nextPitch.startTimeSeconds - 0.001 : Infinity));
+      // Preserve real re-strike spacing: do not create another <=50 ms fragment pair.
+      if (pitchGap <= 0.05 + 1e-9 || !nextPitch || nextPitch.startTimeSeconds - end > 0.05 + 1e-9) note.end = end;
+    };
+    if (minSounding > 0 && pitchGap > 0.12 + 1e-9 && originalEnd - note.startTimeSeconds < minSounding / 1000) {
+      extendTo(note.startTimeSeconds + minSounding / 1000);
+    }
+    const gap = nextHand ? nextHand.startTimeSeconds - note.end : Infinity;
+    if (!note.chord && legatoGap > 0 && gap >= 0.001 - 1e-9 && gap <= legatoGap / 1000 + 1e-9) {
+      extendTo(Math.min(nextHand.startTimeSeconds, originalEnd + 0.15));
+    }
+    nextByPitch.set(note.pitch, note);
+    nextByHand.set(note.hand, note);
+  }
 
   const amplitudes = kept.map(note => note.amplitude).sort((a, b) => a - b);
   const p5 = percentile(amplitudes, 0.05), p95 = percentile(amplitudes, 0.95);

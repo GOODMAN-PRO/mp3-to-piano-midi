@@ -9,7 +9,7 @@ import { toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
-export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.65, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0 };
+export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.65, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0, minSounding: 120, legatoGap: 100, preset: 'full' };
 
 export function noteStats(notes) {
   const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
@@ -47,6 +47,17 @@ export function noteStats(notes) {
     if (amplitudes[i] < 0.35 * percentile(local, 0.5)) quietShortNotes++;
   }
   const previous = new Map();
+  const nextPitch = new Map();
+  let isolatedShortNotes = 0;
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const note = sorted[i];
+    const end = note.startTimeSeconds + note.durationSeconds;
+    const gap = (nextPitch.get(note.pitch) ?? Infinity) - end;
+    if (note.durationSeconds < 0.12 - 1e-9 && !(gap >= -1e-9 && gap <= 0.12 + 1e-9)) isolatedShortNotes++;
+    nextPitch.set(note.pitch, note.startTimeSeconds);
+  }
+  const previousHand = new Map();
+  let sameHandGapsUnder100ms = 0;
   const events = [];
   let fragments = 0, onsetSum = 0, seconds = 0;
   let harmonicPairs = 0, harmonicPairsWeak = 0, firstSimultaneous = 0;
@@ -59,6 +70,10 @@ export function noteStats(notes) {
       onsetSum += note.onset ?? 0;
     }
     previous.set(note.pitch, { end });
+    const hand = handOf(note);
+    const handGap = note.startTimeSeconds - (previousHand.get(hand) ?? Infinity);
+    if (handGap >= 0.001 - 1e-9 && handGap <= 0.1 + 1e-9) sameHandGapsUnder100ms++;
+    previousHand.set(hand, end);
     seconds = Math.max(seconds, end);
     events.push([Math.round(note.startTimeSeconds * 1e9), 1], [Math.round(end * 1e9), -1]);
     while (sorted[firstSimultaneous].startTimeSeconds < note.startTimeSeconds - 0.03 - 1e-9) firstSimultaneous++;
@@ -82,6 +97,12 @@ export function noteStats(notes) {
     seconds,
     notesPerSec: seconds ? notes.length / seconds : 0,
     medianDurationMs: durations.length ? (durations[mid] + durations[Math.floor((durations.length - 1) / 2)]) / 2 : 0,
+    durationP10: percentile(durations, 0.1),
+    durationP50: percentile(durations, 0.5),
+    durationP90: percentile(durations, 0.9),
+    maxDurationMs: durations.at(-1) ?? 0,
+    isolatedShortNotes,
+    sameHandGapsUnder100ms,
     pctUnder100ms: notes.length ? 100 * durations.filter(ms => ms < 100).length / notes.length : 0,
     fragments,
     harmonicPairs,
@@ -167,17 +188,18 @@ async function modelOutput(input) {
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes('--help')) {
-    const flags = Object.entries(defaults).map(([key, value]) => `[--${key === 'splitAt' ? 'split-at' : key} ${value}]`).join(' ');
+    const flags = Object.entries(defaults).map(([key, value]) => `[--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} ${value}]`).join(' ');
     console.log(`Usage: node cli.mjs <audio file> [--out file.mid] ${flags} [--no-dynamics] [--no-split] [--json]`);
+    console.log('--preset accepts full or easy; easy defaults to --legato-gap 150. Set --min-sounding 0 or --legato-gap 0 to disable smoothing.');
     return;
   }
   const input = resolve(args.shift());
   const options = { ...defaults };
   let output = join(dirname(input), `${basename(input, extname(input))}.mid`);
-  let splitHands = true, dynamics = true, json = false;
+  let splitHands = true, dynamics = true, json = false, legatoGapSet = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    const key = arg === '--split-at' ? 'splitAt' : arg.slice(2);
+    const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
     if (arg === '--no-split') splitHands = false;
     else if (arg === '--no-dynamics') dynamics = false;
     else if (arg === '--json') json = true;
@@ -185,15 +207,20 @@ async function main() {
       if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error('--out needs a filename.');
       output = resolve(args[++i]);
     } else if (arg.startsWith('--') && Object.hasOwn(options, key)) {
-      const value = Number(args[++i]);
-      if (!Number.isFinite(value)) throw new Error(`${arg} needs a finite number.`);
+      const value = key === 'preset' ? args[++i] : Number(args[++i]);
+      if (key !== 'preset' && !Number.isFinite(value)) throw new Error(`${arg} needs a finite number.`);
       options[key] = value;
+      if (key === 'legatoGap') legatoGapSet = true;
     } else throw new Error(`Unknown argument: ${arg}`);
   }
   for (const key of ['onset', 'frame', 'legato', 'harmonic', 'ghost']) {
     if (options[key] < 0 || options[key] > 1) throw new Error(`--${key} must be between 0 and 1.`);
   }
-  if (options.align < 0) throw new Error('--align must be nonnegative.');
+  if (!['full', 'easy'].includes(options.preset)) throw new Error('--preset must be full or easy.');
+  if (options.preset === 'easy' && !legatoGapSet) options.legatoGap = 150;
+  for (const key of ['align', 'minSounding', 'legatoGap']) {
+    if (options[key] < 0) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be nonnegative.`);
+  }
   if (!Number.isInteger(options.splitAt) || options.splitAt < 0 || options.splitAt > 127) throw new Error('--split-at must be 0 (automatic) or an integer MIDI pitch from 1 to 127.');
   for (const key of ['min', 'poly', 'tolerance']) {
     if (!Number.isInteger(options[key]) || options[key] < 1) throw new Error(`--${key} must be a positive integer.`);
@@ -207,6 +234,7 @@ async function main() {
   const piano = toPianoNotes(notes, {
     maxPoly: options.poly, legato: options.legato, harmonic: options.harmonic,
     align: options.align, ghost: options.ghost, dynamics, splitAt: options.splitAt,
+    minSounding: options.minSounding, legatoGap: options.legatoGap, preset: options.preset,
   });
   writeFileSync(output, notesToMidi(piano, { splitHands }));
   const stats = { input, output, cacheHit, parameters: { ...options, dynamics, splitHands }, ...noteStats(piano) };

@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import midiPackage from '@tonejs/midi/build/Midi.js';
 import { extractNotes } from '../extract.js';
-import { toPianoNotes as pianoWithDefaults } from '../piano.js';
+import { toPianoNotes as pianoWithLengthDefaults } from '../piano.js';
 import { notesToMidi } from '../midi.js';
 import { noteStats } from '../cli.mjs';
 
 const note = (pitchMidi, startTimeSeconds = 0, durationSeconds = 1, amplitude = 0.5) =>
   ({ pitchMidi, startTimeSeconds, durationSeconds, amplitude });
 // Keep the original processing assertions isolated from the new optional stages.
+const pianoWithDefaults = (notes, options = {}) =>
+  pianoWithLengthDefaults(notes, { minSounding: 0, legatoGap: 0, ...options });
 const toPianoNotes = (notes, options = {}) =>
   pianoWithDefaults(notes, { align: 0, dynamics: false, ghost: 0, ...options })
     .map(({ hand, ...note }) => note);
@@ -198,6 +200,67 @@ assert.equal(shiftedAnchor.playabilityDrops, 0);
 assert.equal(noteStats(shiftedAnchor).handSpanViolations, 0);
 assert.equal(noteStats(shiftedAnchor).handPolyViolations, 0);
 
+const lengthNotes = (notes, options = {}) => pianoWithLengthDefaults(notes, {
+  legato: 0, harmonic: 0, align: 0, dynamics: false, ghost: 0, splitAt: 60, ...options,
+});
+const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-12,
+  `${actual} differs from ${expected}`);
+const isolated = [note(60, 0, 0.08)];
+const isolatedOriginal = structuredClone(isolated);
+close(lengthNotes(isolated)[0].durationSeconds, 0.12);
+assert.deepEqual(isolated, isolatedOriginal);
+close(lengthNotes(isolated, { minSounding: 0 })[0].durationSeconds, 0.08);
+// A nearby same-pitch successor is a re-strike, not an isolated flicker.
+const closeRepeat = lengthNotes([note(60, 0, 0.2), note(60, 0.24, 0.2)]);
+assert.equal(closeRepeat.length, 2);
+close(closeRepeat[0].durationSeconds, 0.239);
+close(closeRepeat[1].startTimeSeconds - closeRepeat[0].durationSeconds, 0.001);
+const spacedRepeatInput = [note(60, 0, 0.2), note(60, 0.28, 0.2)];
+const spacedRepeat = lengthNotes(spacedRepeatInput);
+close(spacedRepeat[0].durationSeconds, 0.2);
+assert.equal(noteStats(spacedRepeat).fragments, 0);
+// Longer custom normalization must not create a <=50 ms fragment either.
+close(lengthNotes([note(60, 0, 0.08), note(60, 0.5, 0.2)],
+  { minSounding: 600, legatoGap: 0 })[0].durationSeconds, 0.08);
+const joinedLineInput = [note(60, 0, 0.2), note(62, 0.28, 0.2)];
+const joinedLineOriginal = structuredClone(joinedLineInput);
+const joinedLine = lengthNotes(joinedLineInput);
+close(joinedLine[0].durationSeconds, 0.28);
+assert.deepEqual(joinedLine.map(n => n.startTimeSeconds), [0, 0.28]);
+assert.deepEqual(joinedLineInput, joinedLineOriginal);
+close(lengthNotes(joinedLineInput, { legatoGap: 0 })[0].durationSeconds, 0.2);
+close(lengthNotes([note(60, 0, 0.2), note(62, 0.32, 0.2)])[0].durationSeconds, 0.2);
+// A larger custom gap still adds at most 150 ms to one note.
+close(lengthNotes([note(60, 0, 0.2), note(62, 0.6, 0.2)],
+  { legatoGap: 500 })[0].durationSeconds, 0.35);
+// Gap-fill follows the hand label, even for a note on the same side of middle C.
+close(lengthNotes([note(60, 0, 0.2), note(62, 0.28, 0.2)],
+  { splitAt: 62 })[0].durationSeconds, 0.2);
+const heldChord = lengthNotes([note(60, 0, 0.2), note(64, 0, 0.2), note(67, 0.28, 0.3)]);
+assert.deepEqual(heldChord.slice(0, 2).map(n => n.durationSeconds), [0.2, 0.2]);
+const disabledLengths = lengthNotes([note(60, 0, 0.08), note(62, 0.16, 0.2)],
+  { minSounding: 0, legatoGap: 0 });
+close(disabledLengths[0].durationSeconds, 0.08);
+close(disabledLengths[1].durationSeconds, 0.2);
+
+// Preserve a quiet melody and bass before the loudness cap chooses inner voices.
+const easyChordInput = [48, 52, 55, 60, 64, 67, 72]
+  .map(pitch => note(pitch, 0, 0.2, pitch === 48 || pitch === 72 ? 0.1 : 0.8));
+const easyChordOriginal = structuredClone(easyChordInput);
+const easyChord = lengthNotes(easyChordInput, { preset: 'easy', maxPoly: 2 });
+assert.deepEqual(easyChord.map(n => [n.pitch, n.hand]), [[48, 'left'], [72, 'right']]);
+assert.deepEqual(easyChordInput, easyChordOriginal);
+const easyShort = lengthNotes([note(48, 0, 0.2), note(60, 0, 0.2), note(67, 0, 0.08)],
+  { preset: 'easy' });
+assert.deepEqual(easyShort.map(n => n.pitch), [48]); // Drop the short melody before normalization.
+close(lengthNotes([note(60, 0, 0.2), note(62, 0.32, 0.2)],
+  { preset: 'easy' })[0].durationSeconds, 0.32);
+close(lengthNotes([note(60, 0, 0.2), note(62, 0.32, 0.2)],
+  { preset: 'easy', legatoGap: 0 })[0].durationSeconds, 0.2);
+const easyMovedAnchor = lengthNotes([note(60, 0, 0.08), note(64, 0.02, 0.2), note(67, 0.04, 0.2)],
+  { preset: 'easy' });
+assert.deepEqual(easyMovedAnchor.map(n => n.pitch), [67]);
+
 assert.deepEqual(extractNotes([], []), []);
 const frames = Array.from({ length: 35 }, (_, i) =>
   Array.from({ length: 88 }, (_, pitch) => pitch === 39 && i >= 4 && i < 24 ? 0.7 : 0));
@@ -260,6 +323,8 @@ assert.equal(labelledSingleTrack.tracks[0].notes.length, 2);
 
 assert.deepEqual(noteStats([]), {
   notes: 0, seconds: 0, notesPerSec: 0, medianDurationMs: 0, pctUnder100ms: 0,
+  durationP10: 0, durationP50: 0, durationP90: 0, maxDurationMs: 0,
+  isolatedShortNotes: 0, sameHandGapsUnder100ms: 0,
   fragments: 0, meanOnsetAtFragmentStart: 0, maxSoundingAtOnce: 0,
   harmonicPairs: 0, harmonicPairsWeak: 0,
   chordGroups: 0, meanChordSpreadMs: 0, velocityP5: 0, velocityP50: 0, velocityP95: 0, quietShortNotes: 0,
@@ -281,10 +346,27 @@ assert.equal(stats.pctUnder100ms, 25); // Exactly 100 ms is excluded.
 assert.equal(stats.fragments, 2); // Touching notes and a 50 ms gap both count.
 assert.ok(Math.abs(stats.meanOnsetAtFragmentStart - 0.3) < 1e-12); // Use each later note's onset.
 assert.equal(stats.maxSoundingAtOnce, 2);
+close(stats.durationP10, 86);
+close(stats.durationP50, 110);
+close(stats.durationP90, 176);
+assert.equal(stats.maxDurationMs, 200);
+assert.equal(stats.isolatedShortNotes, 1);
+assert.equal(stats.sameHandGapsUnder100ms, 0);
 assert.equal(noteStats([
   { pitch: 60, startTimeSeconds: 0.1, durationSeconds: 0.2 },
   { pitch: 60, startTimeSeconds: 0.3, durationSeconds: 0.2 },
 ]).maxSoundingAtOnce, 1); // Floating-point endpoint noise must not create an overlap.
+
+const shortStats = noteStats([
+  { pitch: 60, hand: 'right', startTimeSeconds: 0, durationSeconds: 0.08 },
+  { pitch: 60, hand: 'right', startTimeSeconds: 0.2, durationSeconds: 0.12 },
+  { pitch: 62, hand: 'left', startTimeSeconds: 0.28, durationSeconds: 0.12 },
+  { pitch: 64, hand: 'left', startTimeSeconds: 0.401, durationSeconds: 0.2 },
+  { pitch: 65, hand: 'left', startTimeSeconds: 0.701, durationSeconds: 0.08 },
+  { pitch: 67, hand: 'left', startTimeSeconds: 0.88101, durationSeconds: 0.08 },
+]);
+assert.equal(shortStats.isolatedShortNotes, 2); // Exactly 120 ms to a same-pitch successor is not isolated.
+assert.equal(shortStats.sameHandGapsUnder100ms, 2); // Include 1 and 100 ms, exclude 100.01 ms; respect hand labels.
 
 const harmonicStats = noteStats([
   { pitch: 60, startTimeSeconds: 1, durationSeconds: 0.1, amplitude: 1 },
