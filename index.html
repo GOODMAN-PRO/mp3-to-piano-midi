@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MP3 to Piano MIDI</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 18px/1.5 system-ui, sans-serif;
+      --bg: oklch(0.16 0 0);
+      --surface: oklch(0.23 0 0);
+      --ink: oklch(0.95 0 0);
+      --muted: oklch(0.77 0 0);
+      --accent: oklch(0.88 0.07 140);
+      --border: oklch(0.55 0 0);
+      background: var(--bg);
+      color: var(--ink);
+      accent-color: var(--accent);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 32px 20px; }
+    main { max-width: 640px; margin: auto; }
+    h1 { font-size: 1.8rem; line-height: 1.2; margin: 0 0 12px; }
+    p { margin: 12px 0; }
+    .muted { color: var(--muted); }
+    fieldset { border: 0; padding: 0; margin: 28px 0 24px; min-width: 0; }
+    label { display: block; margin-top: 18px; }
+    label:first-child { margin-top: 0; }
+    input, button, .download { font: inherit; }
+    input:not([type="checkbox"]) { display: block; width: 100%; min-width: 0; min-height: 48px; margin-top: 6px; }
+    input[type="number"], input[type="file"] { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--surface); color: var(--ink); }
+    input::file-selector-button { font: inherit; min-height: 48px; margin-right: 12px; cursor: pointer; }
+    .check { display: flex; align-items: center; gap: 12px; min-height: 48px; cursor: pointer; }
+    input[type="checkbox"] { width: 26px; height: 26px; flex-shrink: 0; }
+    output { float: right; color: var(--muted); }
+    button, .download { display: block; width: 100%; min-height: 52px; padding: 12px 20px; border: 0; border-radius: 8px; background: var(--accent); color: var(--bg); text-align: center; text-decoration: none; font-weight: 650; cursor: pointer; }
+    button:hover:enabled, .download:hover { filter: brightness(1.08); }
+    button:active:enabled, .download:active { filter: brightness(0.94); }
+    button:disabled { background: var(--surface); color: var(--muted); cursor: not-allowed; }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+    progress { display: block; width: 100%; height: 16px; margin-top: 24px; }
+    #status { min-height: 1.5em; overflow-wrap: anywhere; }
+    .download { margin-top: 18px; }
+    [hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>MP3 to Piano MIDI</h1>
+    <p class="muted">Choose audio, convert it, and download a piano MIDI. Your audio stays in this browser.</p>
+    <form id="form">
+      <fieldset id="controls" aria-label="Audio and conversion settings">
+        <label for="file">Audio file</label>
+        <input id="file" type="file" accept="audio/*,.mp3" required>
+        <label for="sensitivity">Sensitivity <output id="sensitivity-value" for="sensitivity">0.5</output></label>
+        <input id="sensitivity" type="range" min="0.1" max="0.9" step="0.05" value="0.5">
+        <label for="threshold">Note threshold <output id="threshold-value" for="threshold">0.3</output></label>
+        <input id="threshold" type="range" min="0.1" max="0.9" step="0.05" value="0.3">
+        <label for="min-length">Min note length (ms)</label>
+        <input id="min-length" type="number" min="1" step="1" value="60" required>
+        <label for="max-poly">Max simultaneous notes</label>
+        <input id="max-poly" type="number" min="1" max="10" step="1" value="6" required>
+        <label class="check" for="split"><input id="split" type="checkbox" checked> Split hands at middle C</label>
+      </fieldset>
+      <button id="convert" type="submit" disabled>Convert</button>
+    </form>
+    <progress id="progress" value="0" max="1" aria-label="Conversion progress"></progress>
+    <p id="status" role="status">Choose an audio file to begin.</p>
+    <p id="summary" aria-live="polite"></p>
+    <a id="download" class="download" hidden>Download MIDI</a>
+  </main>
+  <script type="module" src="/main.js"></script>
+</body>
+</html>
