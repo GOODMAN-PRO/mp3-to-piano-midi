@@ -9,7 +9,7 @@ import { toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
-export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.65 };
+export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.65, harmonic: 0.6 };
 
 export function noteStats(notes) {
   const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
@@ -17,6 +17,7 @@ export function noteStats(notes) {
   const previous = new Map();
   const events = [];
   let fragments = 0, onsetSum = 0, seconds = 0;
+  let harmonicPairs = 0, harmonicPairsWeak = 0, firstSimultaneous = 0;
   for (const note of sorted) {
     const end = note.startTimeSeconds + note.durationSeconds;
     const last = previous.get(note.pitch);
@@ -28,6 +29,16 @@ export function noteStats(notes) {
     previous.set(note.pitch, { end });
     seconds = Math.max(seconds, end);
     events.push([Math.round(note.startTimeSeconds * 1e9), 1], [Math.round(end * 1e9), -1]);
+    while (sorted[firstSimultaneous].startTimeSeconds < note.startTimeSeconds - 0.03 - 1e-9) firstSimultaneous++;
+    let paired = false, weak = false;
+    for (let i = firstSimultaneous; i < sorted.length && sorted[i].startTimeSeconds <= note.startTimeSeconds + 0.03 + 1e-9; i++) {
+      const lower = sorted[i];
+      if (![12, 19, 24].includes(note.pitch - lower.pitch)) continue;
+      paired = true;
+      if ((note.amplitude ?? note.velocity) < 0.6 * (lower.amplitude ?? lower.velocity)) weak = true;
+    }
+    if (paired) harmonicPairs++;
+    if (weak) harmonicPairsWeak++;
   }
   // End events precede starts at the same time: a re-strike is not an overlap.
   events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
@@ -41,6 +52,8 @@ export function noteStats(notes) {
     medianDurationMs: durations.length ? (durations[mid] + durations[Math.floor((durations.length - 1) / 2)]) / 2 : 0,
     pctUnder100ms: notes.length ? 100 * durations.filter(ms => ms < 100).length / notes.length : 0,
     fragments,
+    harmonicPairs,
+    harmonicPairsWeak,
     meanOnsetAtFragmentStart: fragments ? onsetSum / fragments : 0,
     maxSoundingAtOnce,
   };
@@ -132,7 +145,7 @@ async function main() {
       options[key] = value;
     } else throw new Error(`Unknown argument: ${arg}`);
   }
-  for (const key of ['onset', 'frame', 'legato']) {
+  for (const key of ['onset', 'frame', 'legato', 'harmonic']) {
     if (options[key] < 0 || options[key] > 1) throw new Error(`--${key} must be between 0 and 1.`);
   }
   for (const key of ['min', 'poly', 'tolerance']) {
@@ -144,7 +157,7 @@ async function main() {
   const notes = extractNotes(frames, onsets, {
     onsetThresh: options.onset, frameThresh: options.frame, minMs: options.min, energyTolerance: options.tolerance,
   });
-  const piano = toPianoNotes(notes, { maxPoly: options.poly, legato: options.legato });
+  const piano = toPianoNotes(notes, { maxPoly: options.poly, legato: options.legato, harmonic: options.harmonic });
   writeFileSync(output, notesToMidi(piano, { splitHands }));
   const stats = { input, output, cacheHit, parameters: { ...options, splitHands }, ...noteStats(piano) };
   if (json) console.log(JSON.stringify(stats));

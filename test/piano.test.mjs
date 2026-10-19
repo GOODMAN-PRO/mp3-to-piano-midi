@@ -14,7 +14,7 @@ assert.equal(toPianoNotes([note(120)])[0].pitch, 108);
 const overlapping = [note(60, 0, 2, 0.4), note(60, 1, 2, 0.8)];
 const original = structuredClone(overlapping);
 assert.deepEqual(toPianoNotes(overlapping), [
-  { pitch: 60, startTimeSeconds: 0, durationSeconds: 3, velocity: 0.8 },
+  { pitch: 60, startTimeSeconds: 0, durationSeconds: 3, amplitude: 0.8, velocity: 0.8 },
 ]);
 assert.deepEqual(overlapping, original);
 
@@ -44,7 +44,7 @@ const fragments = [
 ];
 const fragmentsOriginal = structuredClone(fragments);
 assert.deepEqual(toPianoNotes(fragments, { legato: 0.5 }), [
-  { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.47 + 0.2, velocity: 0.8, onset: 0.9 },
+  { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.47 + 0.2, amplitude: 0.8, velocity: 0.8, onset: 0.9 },
 ]);
 assert.deepEqual(fragments, fragmentsOriginal);
 assert.equal(toPianoNotes(fragments, { legato: 0 }).length, 3);
@@ -66,8 +66,36 @@ assert.deepEqual(toPianoNotes([
   withOnset(62, 0.01, 1, 0.8, 0.8),
   withOnset(60, 0.5, 0.5, 0.9, 0.1),
 ], { maxPoly: 1 }), [
-  { pitch: 60, startTimeSeconds: 0, durationSeconds: 1, velocity: 0.9, onset: 0.8 },
+  { pitch: 60, startTimeSeconds: 0, durationSeconds: 1, amplitude: 0.9, velocity: 0.9, onset: 0.8 },
 ]);
+
+for (const interval of [12, 19, 24]) {
+  assert.deepEqual(toPianoNotes([note(60, 1, 2, 1), note(60 + interval, 1, 1, 0.5)],
+    { harmonic: 0.6 }).map(n => n.pitch), [60]);
+}
+const harmonicNotes = [note(60, 1, 2, 1), note(72, 1, 1, 0.5)];
+const harmonicOriginal = structuredClone(harmonicNotes);
+assert.equal(toPianoNotes(harmonicNotes, { harmonic: 0.6 }).length, 1);
+assert.deepEqual(harmonicNotes, harmonicOriginal);
+assert.equal(toPianoNotes(harmonicNotes, { harmonic: 0 }).length, 2);
+assert.equal(toPianoNotes([note(60, 1, 2, 1), note(72, 1, 1, 0.95)], { harmonic: 0.6 }).length, 2);
+assert.equal(toPianoNotes([note(60, 1, 2, 1), note(72, 1, 1, 0.6)], { harmonic: 0.6 }).length, 2);
+// The candidate can start before or after its lower note, including the 30 ms boundary.
+for (const offset of [-0.03, 0.03]) {
+  assert.equal(toPianoNotes([note(60, 1, 2, 1), note(72, 1 + offset, 1, 0.5)],
+    { harmonic: 0.6 }).length, 1);
+}
+assert.equal(toPianoNotes([note(60, 1, 2, 1), note(72, 1.03001, 1, 0.5)], { harmonic: 0.6 }).length, 2);
+// Measure actual shared duration, not just the lower note's length.
+assert.equal(toPianoNotes([note(60, 1, 0.61, 1), note(72, 1.03, 1, 0.5)], { harmonic: 0.6 }).length, 2);
+assert.equal(toPianoNotes([note(60, 1.03, 0.6, 1), note(72, 1, 1, 0.5)], { harmonic: 0.6 }).length, 1);
+assert.equal(toPianoNotes([note(60, 1, 1, 0.5), note(72, 1, 2, 1)], { harmonic: 0.6 }).length, 2);
+// Cleanup frees a chord slot before the cap chooses the remaining notes.
+assert.deepEqual(toPianoNotes([note(60, 0, 1, 1), note(72, 0, 1, 0.5), note(67, 0, 1, 0.4)],
+  { harmonic: 0.6, maxPoly: 2 }).map(n => n.pitch), [60, 67]);
+// Removing an early ghost must not move the original chord-group boundary.
+assert.deepEqual(toPianoNotes([note(72, 0, 1, 0.3), note(60, 0.02, 2, 1), note(64, 0.04, 1, 0.8)],
+  { harmonic: 0.6, maxPoly: 1 }).map(n => n.pitch), [60, 64]);
 
 assert.deepEqual(extractNotes([], []), []);
 const frames = Array.from({ length: 35 }, (_, i) =>
@@ -122,6 +150,7 @@ assert.equal(singleTrack.tracks[0].notes.length, 3);
 assert.deepEqual(noteStats([]), {
   notes: 0, seconds: 0, notesPerSec: 0, medianDurationMs: 0, pctUnder100ms: 0,
   fragments: 0, meanOnsetAtFragmentStart: 0, maxSoundingAtOnce: 0,
+  harmonicPairs: 0, harmonicPairsWeak: 0,
 });
 const measuredNotes = [
   { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.08, onset: 0.9 },
@@ -143,5 +172,23 @@ assert.equal(noteStats([
   { pitch: 60, startTimeSeconds: 0.1, durationSeconds: 0.2 },
   { pitch: 60, startTimeSeconds: 0.3, durationSeconds: 0.2 },
 ]).maxSoundingAtOnce, 1); // Floating-point endpoint noise must not create an overlap.
+
+const harmonicStats = noteStats([
+  { pitch: 60, startTimeSeconds: 1, durationSeconds: 0.1, amplitude: 1 },
+  { pitch: 67, startTimeSeconds: 1.03, durationSeconds: 0.1, amplitude: 0.8 },
+  { pitch: 79, startTimeSeconds: 1.015, durationSeconds: 1, amplitude: 0.4 },
+  { pitch: 84, startTimeSeconds: 1, durationSeconds: 1, amplitude: 0.6 },
+  { pitch: 72, startTimeSeconds: 1.03001, durationSeconds: 1, amplitude: 0.1 },
+]);
+assert.equal(harmonicStats.harmonicPairs, 2); // Multiple lower matches count once; coverage is not a metric condition.
+assert.equal(harmonicStats.harmonicPairsWeak, 1); // Strictly below 0.6; later lower-note starts qualify too.
+assert.equal(noteStats([
+  { pitch: 60, startTimeSeconds: 1, durationSeconds: 1, amplitude: 1 },
+  { pitch: 72, startTimeSeconds: 1.03, durationSeconds: 1, amplitude: 0.5 },
+]).harmonicPairsWeak, 1);
+assert.equal(noteStats([
+  { pitch: 60, startTimeSeconds: 0, durationSeconds: 1, amplitude: 0.04, velocity: 0.05 },
+  { pitch: 72, startTimeSeconds: 0, durationSeconds: 1, amplitude: 0.01, velocity: 0.05 },
+]).harmonicPairsWeak, 1); // Compare raw amplitude, before the velocity floor.
 
 console.log('piano, extraction, MIDI, and statistics tests passed');

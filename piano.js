@@ -1,4 +1,4 @@
-export function toPianoNotes(notes, { maxPoly = 6, legato = 0.65 } = {}) {
+export function toPianoNotes(notes, { maxPoly = 6, legato = 0.65, harmonic = 0.6 } = {}) {
   const sorted = notes.map(note => {
     let pitch = note.pitchMidi;
     while (pitch < 21) pitch += 12;
@@ -30,12 +30,30 @@ export function toPianoNotes(notes, { maxPoly = 6, legato = 0.65 } = {}) {
     }
   }
 
+  const ghosts = new Set();
+  if (harmonic > 0) {
+    let firstNear = 0;
+    for (const note of merged) {
+      while (merged[firstNear].startTimeSeconds < note.startTimeSeconds - 0.03 - 1e-9) firstNear++;
+      for (let i = firstNear; i < merged.length && merged[i].startTimeSeconds <= note.startTimeSeconds + 0.03 + 1e-9; i++) {
+        const lower = merged[i];
+        if (![12, 19, 24].includes(note.pitch - lower.pitch) || !(note.amplitude < harmonic * lower.amplitude)) continue;
+        const overlap = Math.min(note.end, lower.end) - Math.max(note.startTimeSeconds, lower.startTimeSeconds);
+        if (overlap >= 0.6 * (note.end - note.startTimeSeconds) - 1e-9) {
+          ghosts.add(note);
+          break;
+        }
+      }
+    }
+  }
+
   const kept = [];
   for (let i = 0; i < merged.length;) {
     let end = i + 1;
     while (end < merged.length &&
       merged[end].startTimeSeconds - merged[i].startTimeSeconds <= 0.03) end++;
-    const group = merged.slice(i, end);
+    // Keep the original chord-group anchors, removing ghosts before they use a cap slot.
+    const group = merged.slice(i, end).filter(note => !ghosts.has(note));
     group.sort((a, b) => b.amplitude - a.amplitude);
     kept.push(...group.slice(0, maxPoly));
     i = end;
@@ -45,6 +63,7 @@ export function toPianoNotes(notes, { maxPoly = 6, legato = 0.65 } = {}) {
     pitch: note.pitch,
     startTimeSeconds: note.startTimeSeconds,
     durationSeconds: note.end - note.startTimeSeconds,
+    amplitude: note.amplitude,
     velocity: Math.min(1, Math.max(0.05, note.amplitude)),
     ...(note.onset === undefined ? {} : { onset: note.onset }),
   }));

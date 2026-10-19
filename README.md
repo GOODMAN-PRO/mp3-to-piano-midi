@@ -23,6 +23,8 @@ Open the local URL printed by Vite. The build creates `dist/`, ready for static 
 
 Weak-onset fragments of the same pitch are joined across gaps of up to 80 ms before chord limiting. Starts with an onset strength of 0.65 or greater stay separate, preserving stronger repeated notes; overlapping notes still merge as before. This reduces false re-attacks in full mixes, though transcription remains approximate.
 
+Automatic harmonic cleanup removes much quieter overtones sharing a start and most of their duration with a lower note, while keeping strong octave doublings.
+
 Choose a file, press **Convert**, then **Download MIDI**. The download keeps the original filename with a `.mid` extension.
 
 ## Command line
@@ -35,11 +37,13 @@ node cli.mjs "song.mp3" --out "song.mid" --json
 
 The CLI uses the same extraction, smoothing, and MIDI code as the browser. It decodes to mono 22050 Hz, loads `public/model` locally, and runs inference on the CPU. The first run can take several minutes; model outputs are saved in `.cache/` so changing parameters skips inference. Cache entries are checked against the source path, size, modification time, and model timestamp. Delete the corresponding cache file to force inference again.
 
-Options: `--onset`, `--frame`, `--min` (milliseconds), `--poly`, `--tolerance` (model frames), `--legato` (weak-onset threshold; `0` disables fragment smoothing), and `--no-split`. Run `node cli.mjs --help` for defaults. Without `--out`, MIDI is written beside the input with a `.mid` extension.
+Options: `--onset`, `--frame`, `--min` (milliseconds), `--poly`, `--tolerance` (model frames), `--legato` (weak-onset threshold; `0` disables fragment smoothing), `--harmonic` (amplitude ratio; `0` disables harmonic cleanup), and `--no-split`. Run `node cli.mjs --help` for defaults. Without `--out`, MIDI is written beside the input with a `.mid` extension.
 
-Browser and CLI defaults are onset `0.5`, frame `0.3`, minimum `80` ms, polyphony `6`, energy tolerance `11` frames, legato `0.65`, and split hands enabled. For the previous behaviour, use `--min 60 --legato 0`.
+Browser and CLI defaults are onset `0.5`, frame `0.3`, minimum `80` ms, polyphony `6`, energy tolerance `11` frames, legato `0.65`, harmonic `0.6`, and split hands enabled. Harmonic cleanup considers notes 12, 19, or 24 semitones above a louder note, with starts within 30 ms and at least 60% duration overlap. For the original behaviour, use `--min 60 --legato 0 --harmonic 0`.
 
 Statistics include note count, last note end in seconds, notes/second, median duration, percentage under 100 ms, same-pitch pairs separated by at most 50 ms, their later notes' mean onset strength, and peak sounding notes. Strong repeated notes also count in the fragment statistic. `--json` prints one JSON object to stdout; progress goes to stderr.
+
+`harmonicPairs` counts upper notes with a note 12, 19, or 24 semitones below starting within 30 ms; `harmonicPairsWeak` counts those below 0.6 times a qualifying lower note's raw amplitude, regardless of duration overlap.
 
 ## Getting the MIDI onto a Meta Quest 3
 
