@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import midiPackage from '@tonejs/midi/build/Midi.js';
 import { extractNotes } from '../extract.js';
-import { toPianoNotes as pianoWithLengthDefaults } from '../piano.js';
+import { estimateKey, toPianoNotes as pianoWithLengthDefaults } from '../piano.js';
 import { notesToMidi } from '../midi.js';
 import { defaults, noteStats } from '../cli.mjs';
 
@@ -14,7 +14,7 @@ const note = (pitchMidi, startTimeSeconds = 0, durationSeconds = 1, amplitude = 
   ({ pitchMidi, startTimeSeconds, durationSeconds, amplitude });
 // Keep the original processing assertions isolated from the new optional stages.
 const pianoWithDefaults = (notes, options = {}) =>
-  pianoWithLengthDefaults(notes, { minSounding: 0, legatoGap: 0, ...options });
+  pianoWithLengthDefaults(notes, { minSounding: 0, legatoGap: 0, maxSounding: 0, keyClean: 0, wobble: 0, melody: 0, ...options });
 const toPianoNotes = (notes, options = {}) =>
   pianoWithDefaults(notes, { align: 0, dynamics: false, ghost: 0, ...options })
     .map(({ hand, ...note }) => note);
@@ -229,7 +229,9 @@ assert.equal(noteStats(shiftedAnchor).handSpanViolations, 0);
 assert.equal(noteStats(shiftedAnchor).handPolyViolations, 0);
 
 const lengthNotes = (notes, options = {}) => pianoWithLengthDefaults(notes, {
-  legato: 0, harmonic: 0, align: 0, dynamics: false, ghost: 0, splitAt: 60, ...options,
+  legato: 0, harmonic: 0, align: 0, dynamics: false, ghost: 0, splitAt: 60,
+  maxSounding: 0, keyClean: 0, wobble: 0, melody: 0, minSounding: 120,
+  legatoGap: options.preset === 'easy' ? 150 : 100, ...options,
 });
 const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-12,
   `${actual} differs from ${expected}`);
@@ -301,6 +303,98 @@ const tinyAligned = pianoWithDefaults([
 const tinyCs = tinyAligned.filter(n => n.pitch === 60);
 assert.ok(tinyAligned.every(n => n.durationSeconds > 0));
 assert.ok(tinyCs[0].startTimeSeconds + tinyCs[0].durationSeconds <= tinyCs[1].startTimeSeconds);
+
+const coherenceNotes = (notes, options = {}) => lengthNotes(notes, {
+  minSounding: 0, legatoGap: 0, maxPoly: 10, ...options,
+});
+// Release sustained notes without dropping attacks; a new hand gets first choice of its fingers.
+const capInput = [note(48, 0, 1, 0.9), note(60, 0.1, 1, 0.1), note(64, 0.2, 0.2, 0.8)];
+const capOriginal = structuredClone(capInput);
+const capped = coherenceNotes(capInput, { maxSounding: 2 });
+assert.equal(capped.length, 3);
+close(capped.find(n => n.pitch === 48).durationSeconds, 1);
+close(capped.find(n => n.pitch === 60).durationSeconds, 0.099);
+assert.equal(noteStats(capped).maxSoundingAtOnce, 2);
+assert.deepEqual(capInput, capOriginal);
+assert.equal(coherenceNotes(capInput, { maxSounding: 0 })[1].durationSeconds, 1);
+const oldestFirst = coherenceNotes([note(60, 0, 1, 0.9), note(62, 0.1, 1, 0.1), note(64, 0.2, 1)],
+  { maxSounding: 2 });
+close(oldestFirst[0].durationSeconds, 0.199);
+close(oldestFirst[1].durationSeconds, 1);
+const quietTie = coherenceNotes([note(60, 0, 1, 0.9), note(64, 0, 1, 0.1), note(67, 0.2, 1)],
+  { maxSounding: 2 });
+close(quietTie.find(n => n.pitch === 60).durationSeconds, 1);
+close(quietTie.find(n => n.pitch === 64).durationSeconds, 0.199);
+const protectedShort = coherenceNotes([note(60, 0, 0.5), note(62, 0.04, 0.5)], { maxSounding: 1 });
+close(protectedShort[0].durationSeconds, 0.5);
+assert.equal(noteStats(protectedShort).maxSoundingAtOnce, 2); // The 60 ms floor takes priority over the cap.
+close(coherenceNotes([note(60, 0, 0.5), note(62, 0.061, 0.5)],
+  { maxSounding: 1 })[0].durationSeconds, 0.06);
+// Finger release is allowed to shorten a normalized note, while preserving its separate 60 ms floor.
+close(coherenceNotes([note(60, 0, 1), note(62, 0.08, 1)],
+  { maxSounding: 1, minSounding: 100 })[0].durationSeconds, 0.079);
+close(coherenceNotes([note(60, 0, 1), note(62, 0.12, 1)],
+  { maxSounding: 1, minSounding: 100 })[0].durationSeconds, 0.119);
+const overCapChord = coherenceNotes([60, 64, 67].map(pitch => note(pitch, 0, 0.2)), { maxSounding: 1 });
+assert.equal(overCapChord.length, 3);
+assert.ok(overCapChord.every(n => n.durationSeconds === 0.2));
+
+// A global key is only a hint: keep strong chromatic notes, long chromatic notes, and a quiet passage.
+const keyInput = [
+  ...[60, 62, 64, 65, 67, 69, 71].map((pitch, i) => note(pitch, i * 0.05,
+    [6.35, 3.48, 4.38, 4.09, 5.19, 3.66, 2.88][i], 1)),
+  note(61, 0.4, 0.15, 0.1), note(63, 0.6, 0.25, 0.1),
+  note(66, 0.8, 0.15, 0.6), note(68, 0.95, 0.15, 0.8),
+  note(61, 10, 0.1, 0.1), note(63, 10.2, 0.1, 0.1), note(66, 10.4, 0.1, 0.1),
+];
+const keyOriginal = structuredClone(keyInput);
+assert.equal(estimateKey(keyInput).name, 'C major');
+const keyCleaned = coherenceNotes(keyInput, { keyClean: 0.6 });
+assert.deepEqual(keyCleaned.map(n => n.startTimeSeconds), keyInput.filter(n => n.startTimeSeconds !== 0.4)
+  .map(n => n.startTimeSeconds));
+assert.equal(coherenceNotes(keyInput, { keyClean: 0 }).length, keyInput.length);
+assert.deepEqual(keyInput, keyOriginal);
+
+const wobbleInput = [note(60, 0, 0.08), note(61, 0.1, 0.04), note(60, 0.2, 0.08)];
+const wobbleOriginal = structuredClone(wobbleInput);
+const wobbleMerged = coherenceNotes(wobbleInput, { wobble: 150 });
+assert.equal(wobbleMerged.length, 1);
+assert.equal(wobbleMerged[0].pitch, 60);
+close(wobbleMerged[0].startTimeSeconds, 0);
+close(wobbleMerged[0].durationSeconds, 0.28);
+assert.equal(noteStats(wobbleMerged).wobblePairs, 0);
+assert.deepEqual(wobbleInput, wobbleOriginal);
+assert.equal(coherenceNotes(wobbleInput, { wobble: 0 }).length, 3);
+const middleWins = coherenceNotes([note(60, 0, 0.04), note(61, 0.1, 0.2), note(60, 0.2, 0.04)],
+  { wobble: 150 });
+assert.equal(middleWins.length, 1);
+assert.equal(middleWins[0].pitch, 61);
+close(middleWins[0].startTimeSeconds, 0);
+close(middleWins[0].durationSeconds, 0.3);
+assert.equal(coherenceNotes([note(60, 0, 0.08), note(61, 0.16, 0.04), note(60, 0.32, 0.08)],
+  { wobble: 150 }).length, 3);
+assert.equal(coherenceNotes([note(60, 0, 0.08), note(61, 0.1, 0.04), note(62, 0.2, 0.08)],
+  { wobble: 150 }).length, 3);
+assert.equal(coherenceNotes([...wobbleInput, note(65, 0.1, 0.04)], { wobble: 150 }).length, 4);
+assert.equal(coherenceNotes(wobbleInput, { wobble: 150, splitAt: 61 }).length, 3);
+// Do not erase an individually longer middle note merely because two shorter repeats add up to more time.
+assert.equal(coherenceNotes([note(60, 0, 0.08), note(61, 0.1, 0.12), note(60, 0.2, 0.08)],
+  { wobble: 150 }).length, 3);
+
+const melodyInput = [note(60, 0, 0.2), note(62, 1, 0.2), note(74, 1, 0.2)];
+const melodic = coherenceNotes(melodyInput, { preset: 'easy', melody: 3 });
+assert.deepEqual(melodic.map(n => n.pitch), [60, 62]);
+assert.deepEqual(coherenceNotes(melodyInput, { preset: 'easy', melody: 0 }).map(n => n.pitch), [60, 74]);
+assert.deepEqual(coherenceNotes(melodyInput, { preset: 'full', melody: 3 }).map(n => n.pitch), [60, 62, 74]);
+assert.equal(noteStats(melodic).melodyJumpRate, 0);
+const nearbyRepeat = [note(60, 0, 0.2), note(62, 0.7, 0.2), note(62, 0.94, 0.2), note(74, 0.94, 0.2)];
+assert.deepEqual(coherenceNotes(nearbyRepeat, { preset: 'easy', melody: 3 }).map(n => n.pitch), [60, 62, 74]);
+const futureRepeat = [...melodyInput, note(62, 1.24, 0.2)];
+assert.deepEqual(coherenceNotes(futureRepeat, { preset: 'easy', melody: 3 }).map(n => n.pitch), [60, 74, 62]);
+for (const input of [nearbyRepeat, futureRepeat]) {
+  assert.equal(noteStats(coherenceNotes(input, { preset: 'easy', melody: 3 })).fragments, 0);
+}
+assert.deepEqual(coherenceNotes(melodyInput, { preset: 'easy', melody: 3 }), melodic);
 
 assert.deepEqual(extractNotes([], []), []);
 const frames = Array.from({ length: 35 }, (_, i) =>
@@ -411,7 +505,62 @@ assert.deepEqual(noteStats([]), {
   harmonicPairs: 0, harmonicPairsWeak: 0,
   chordGroups: 0, meanChordSpreadMs: 0, velocityP5: 0, velocityP50: 0, velocityP95: 0, quietShortNotes: 0,
   leftNotes: 0, rightNotes: 0, handSpanViolations: 0, handPolyViolations: 0, splitPoint: 60, playabilityDrops: 0,
+  keyEstimate: null, outOfKeyPct: 0, meanSounding: 0, pctTimeSounding5plus: 0, wobblePairs: 0, melodyJumpRate: 0,
 });
+
+// Exact profile-shaped note-time gives a known key independent of amplitude and register.
+const majorProfile = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const minorProfile = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+const keyNotes = (profile, tonic = 0) => profile.map((durationSeconds, pitch) => ({
+  pitch: 60 + tonic + pitch, startTimeSeconds: pitch, durationSeconds, amplitude: 1 / (pitch + 1),
+}));
+assert.equal(estimateKey([]), null);
+assert.equal(estimateKey([null]), null);
+assert.equal(estimateKey([{ pitch: 60, durationSeconds: NaN }]), null);
+assert.equal(estimateKey(keyNotes(Array(12).fill(1))), null);
+const cMajor = estimateKey(keyNotes(majorProfile));
+assert.equal(cMajor.name, 'C major');
+assert.equal(cMajor.tonic, 0);
+assert.equal(cMajor.mode, 'major');
+assert.deepEqual(cMajor.scale, [0, 2, 4, 5, 7, 9, 11]);
+close(cMajor.correlation, 1);
+const transposedMinor = estimateKey(keyNotes(minorProfile, 3));
+assert.equal(transposedMinor.tonic, 3);
+assert.equal(transposedMinor.mode, 'minor');
+assert.deepEqual([...transposedMinor.scale].sort((a, b) => a - b), [1, 3, 5, 6, 8, 10, 11]);
+close(transposedMinor.correlation, 1);
+const keyStats = noteStats(keyNotes(majorProfile));
+assert.equal(keyStats.keyEstimate, 'C major');
+close(keyStats.outOfKeyPct, 100 * [1, 3, 6, 8, 10].reduce((sum, pc) => sum + majorProfile[pc], 0)
+  / majorProfile.reduce((sum, duration) => sum + duration, 0));
+
+const soundingStats = noteStats([
+  ...[60, 62, 64, 65, 67].map(pitch => ({ pitch, startTimeSeconds: 10, durationSeconds: 2 })),
+  { pitch: 69, startTimeSeconds: 11, durationSeconds: 2 },
+  { pitch: 71, startTimeSeconds: 14, durationSeconds: 1 },
+]);
+close(soundingStats.meanSounding, 13 / 5); // Include the internal silence, exclude the leading ten seconds.
+close(soundingStats.pctTimeSounding5plus, 40);
+assert.equal(soundingStats.maxSoundingAtOnce, 6);
+const metricLine = (pitches, times, hand = 'right') => pitches.map((pitch, i) => ({
+  pitch, hand, startTimeSeconds: times[i], durationSeconds: 0.05,
+}));
+assert.equal(noteStats(metricLine([60, 61, 60, 61], [0, 0.1, 0.2, 0.3])).wobblePairs, 2);
+assert.equal(noteStats(metricLine([60, 61, 60], [0, 0.15, 0.3])).wobblePairs, 1);
+assert.equal(noteStats(metricLine([60, 61, 60], [0, 0.15001, 0.3])).wobblePairs, 0);
+assert.equal(noteStats([
+  ...metricLine([60, 61, 60], [0, 0.1, 0.2]),
+  { pitch: 65, hand: 'right', startTimeSeconds: 0.11, durationSeconds: 0.05 },
+]).wobblePairs, 0); // A semitone inside a hand chord is not a monophonic wobble.
+assert.equal(noteStats([
+  ...metricLine([60, 60], [0, 0.2]), ...metricLine([61], [0.1], 'left'),
+]).wobblePairs, 0);
+const jumpStats = noteStats([
+  ...metricLine([60, 64, 72, 67, 76], [0, 0.01, 0.2, 0.4, 0.6]),
+  ...metricLine([100, 30], [0, 0.2], 'left'),
+]);
+close(jumpStats.melodyJumpRate, 2 / 3); // Highest right-hand voice: 64→72→67→76.
+assert.equal(noteStats(metricLine([60, 67], [0, 0.2])).melodyJumpRate, 0);
 const measuredNotes = [
   { pitch: 60, startTimeSeconds: 0, durationSeconds: 0.08, onset: 0.9 },
   { pitch: 60, startTimeSeconds: 0.08, durationSeconds: 0.12, onset: 0.2 },
@@ -570,14 +719,15 @@ async function browserRun(preset, { empty = false, fail = false } = {}) {
 const cliExtraction = { onsetThresh: defaults.onset, frameThresh: defaults.frame, minMs: defaults.min };
 const cliPiano = { maxPoly: defaults.poly, legato: defaults.legato, harmonic: defaults.harmonic,
   align: defaults.align, ghost: defaults.ghost, splitAt: defaults.splitAt, minSounding: defaults.minSounding,
-  legatoGap: defaults.legatoGap };
+  legatoGap: defaults.legatoGap, maxSounding: defaults.maxSounding, keyClean: defaults.keyClean,
+  wobble: defaults.wobble, melody: defaults.melody };
 for (const preset of ['full', 'easy']) {
   const browser = await browserRun(preset);
   assert.deepEqual({ ...browser.extractionOptions }, cliExtraction);
   assert.deepEqual({ ...browser.pianoOptions }, { maxPoly: defaults.poly, preset });
   const cliNotes = pianoWithLengthDefaults(extractNotes(frames, strongOnsets, {
     ...cliExtraction, energyTolerance: defaults.tolerance,
-  }), { ...cliPiano, legatoGap: preset === 'easy' ? 150 : defaults.legatoGap, preset });
+  }), { ...cliPiano, maxSounding: preset === 'easy' ? 5 : defaults.maxSounding, preset });
   assert.deepEqual(browser.output, cliNotes);
   assert.match(browser.element('#summary').textContent, new RegExp(`^${cliNotes.length} notes`));
   assert.equal(browser.element('#download').hidden, false);
@@ -597,6 +747,8 @@ const defaultsFixture = [
   ...[0.9, 0.62, 0.67, 0.72].map((onset, i) => withOnset(60, i * 0.2, 0.2, 0.5, onset)),
   note(60, 2, 1, 0.5), note(72, 2.02, 1, 0.275), note(60, 4, 0.09, 0.8), note(62, 4.25, 0.2, 0.8),
   ...[48, 50, 52, 54, 56, 58, 60].map((pitch, i) => note(pitch, 6 + i * 0.004, 0.3, 0.4 + i / 10)),
+  ...[60, 62, 64, 65, 67, 69].map((pitch, i) => note(pitch, 10 + i * 0.1, 1)),
+  ...wobbleInput.map(n => ({ ...n, startTimeSeconds: n.startTimeSeconds + 20 })),
 ];
 assert.deepEqual(pianoWithLengthDefaults(defaultsFixture), pianoWithLengthDefaults(defaultsFixture, cliPiano));
 const failedBrowser = await browserRun('full', { fail: true });

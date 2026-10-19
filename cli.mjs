@@ -5,11 +5,11 @@ import { spawnSync } from 'node:child_process';
 import { BasicPitch } from '@spotify/basic-pitch';
 import * as tf from '@tensorflow/tfjs';
 import { extractNotes } from './extract.js';
-import { toPianoNotes } from './piano.js';
+import { estimateKey, toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
-export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.7, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0, minSounding: 120, legatoGap: 100, preset: 'full' };
+export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.7, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0, minSounding: 100, legatoGap: 0, maxSounding: 6, keyClean: 0.6, wobble: 0, melody: 3, preset: 'full' };
 
 export function noteStats(notes) {
   const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
@@ -25,6 +25,7 @@ export function noteStats(notes) {
   let chordGroups = 0, chordSpread = 0, quietShortNotes = 0, firstLocal = 0, lastLocal = 0;
   const handOf = note => note.hand ?? (note.pitch >= 60 ? 'right' : 'left');
   let handSpanViolations = 0, handPolyViolations = 0;
+  const handAttacks = { left: [], right: [] }, melody = [];
   for (let i = 0; i < sorted.length;) {
     let end = i + 1;
     while (end < sorted.length && sorted[end].startTimeSeconds <= sorted[i].startTimeSeconds + 0.03 + 1e-9) end++;
@@ -37,6 +38,18 @@ export function noteStats(notes) {
     if (hands.some(pitches => pitches.length && Math.max(...pitches) - Math.min(...pitches) > 14)) handSpanViolations++;
     if (hands.some(pitches => pitches.length > 5)) handPolyViolations++;
     i = end;
+  }
+  for (const hand of ['left', 'right']) {
+    const notes = sorted.filter(note => handOf(note) === hand);
+    for (let i = 0; i < notes.length;) {
+      let end = i + 1;
+      while (end < notes.length && notes[end].startTimeSeconds <= notes[i].startTimeSeconds + 0.03 + 1e-9) end++;
+      const pitches = [...new Set(notes.slice(i, end).map(note => note.pitch))];
+      // A chord breaks a wobble run; its arbitrary pitch order is not a melody.
+      handAttacks[hand].push({ start: notes[i].startTimeSeconds, pitch: pitches.length === 1 ? pitches[0] : null });
+      if (hand === 'right') melody.push(Math.max(...pitches));
+      i = end;
+    }
   }
   for (let i = 0; i < sorted.length; i++) {
     const note = sorted[i];
@@ -89,8 +102,30 @@ export function noteStats(notes) {
   }
   // End events precede starts at the same time: a re-strike is not an overlap.
   events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  let sounding = 0, maxSoundingAtOnce = 0;
-  for (const [, delta] of events) maxSoundingAtOnce = Math.max(maxSoundingAtOnce, sounding += delta);
+  let sounding = 0, maxSoundingAtOnce = 0, soundingTime = 0, crowdedTime = 0;
+  let previousTime = events[0]?.[0] ?? 0;
+  for (const [time, delta] of events) {
+    soundingTime += sounding * (time - previousTime);
+    if (sounding >= 5) crowdedTime += time - previousTime;
+    maxSoundingAtOnce = Math.max(maxSoundingAtOnce, sounding += delta);
+    previousTime = time;
+  }
+  const span = events.length ? events.at(-1)[0] - events[0][0] : 0;
+  const key = estimateKey(sorted);
+  let noteTime = 0, outOfKeyTime = 0, wobblePairs = 0, melodyJumps = 0;
+  for (const note of sorted) {
+    noteTime += note.durationSeconds;
+    if (key && !key.scale.includes(note.pitch % 12)) outOfKeyTime += note.durationSeconds;
+  }
+  for (const attacks of Object.values(handAttacks)) {
+    for (let i = 2; i < attacks.length; i++) {
+      const [a, b, c] = attacks.slice(i - 2, i + 1);
+      if ([a, b, c].every(note => note.pitch !== null) && a.pitch === c.pitch &&
+        Math.abs(a.pitch - b.pitch) === 1 && b.start - a.start <= 0.15 + 1e-9 &&
+        c.start - b.start <= 0.15 + 1e-9) wobblePairs++;
+    }
+  }
+  for (let i = 1; i < melody.length; i++) if (Math.abs(melody[i] - melody[i - 1]) > 7) melodyJumps++;
   const mid = Math.floor(durations.length / 2);
   return {
     notes: notes.length,
@@ -121,6 +156,12 @@ export function noteStats(notes) {
     playabilityDrops: notes.playabilityDrops ?? 0,
     meanOnsetAtFragmentStart: fragments ? onsetSum / fragments : 0,
     maxSoundingAtOnce,
+    keyEstimate: key?.name ?? null,
+    outOfKeyPct: noteTime ? 100 * outOfKeyTime / noteTime : 0,
+    meanSounding: span ? soundingTime / span : 0,
+    pctTimeSounding5plus: span ? 100 * crowdedTime / span : 0,
+    wobblePairs,
+    melodyJumpRate: melody.length > 1 ? melodyJumps / (melody.length - 1) : 0,
   };
 }
 
@@ -191,13 +232,14 @@ async function main() {
   if (!args.length || args.includes('--help')) {
     const flags = Object.entries(defaults).map(([key, value]) => `[--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} ${value}]`).join(' ');
     console.log(`Usage: node cli.mjs <audio file> [--out file.mid] ${flags} [--no-dynamics] [--no-split] [--json]`);
-    console.log('--preset accepts full or easy; easy defaults to --legato-gap 150. Set --min-sounding 0 or --legato-gap 0 to disable smoothing.');
+    console.log('--preset accepts full or easy; easy defaults to --max-sounding 5 unless supplied explicitly. Set --min-sounding 0 or --legato-gap 0 to disable length smoothing.');
+    console.log('--max-sounding, --key-clean, --wobble and --melody accept 0 to disable their cleanup steps; --melody only affects Easy.');
     return;
   }
   const input = resolve(args.shift());
   const options = { ...defaults };
   let output = join(dirname(input), `${basename(input, extname(input))}.mid`);
-  let splitHands = true, dynamics = true, json = false, legatoGapSet = false;
+  let splitHands = true, dynamics = true, json = false, maxSoundingSet = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
@@ -211,15 +253,15 @@ async function main() {
       const value = key === 'preset' ? args[++i] : Number(args[++i]);
       if (key !== 'preset' && !Number.isFinite(value)) throw new Error(`${arg} needs a finite number.`);
       options[key] = value;
-      if (key === 'legatoGap') legatoGapSet = true;
+      if (key === 'maxSounding') maxSoundingSet = true;
     } else throw new Error(`Unknown argument: ${arg}`);
   }
-  for (const key of ['onset', 'frame', 'legato', 'harmonic', 'ghost']) {
-    if (options[key] < 0 || options[key] > 1) throw new Error(`--${key} must be between 0 and 1.`);
+  for (const key of ['onset', 'frame', 'legato', 'harmonic', 'ghost', 'keyClean']) {
+    if (options[key] < 0 || options[key] > 1) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be between 0 and 1.`);
   }
   if (!['full', 'easy'].includes(options.preset)) throw new Error('--preset must be full or easy.');
-  if (options.preset === 'easy' && !legatoGapSet) options.legatoGap = 150;
-  for (const key of ['align', 'minSounding', 'legatoGap']) {
+  if (options.preset === 'easy' && !maxSoundingSet) options.maxSounding = 5;
+  for (const key of ['align', 'minSounding', 'legatoGap', 'wobble']) {
     if (options[key] < 0) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be nonnegative.`);
   }
   if (!Number.isInteger(options.splitAt) || options.splitAt < 0 || options.splitAt > 127) throw new Error('--split-at must be 0 (automatic) or an integer MIDI pitch from 1 to 127.');
@@ -227,6 +269,8 @@ async function main() {
     if (!Number.isInteger(options[key]) || options[key] < 1) throw new Error(`--${key} must be a positive integer.`);
   }
   if (options.poly > 10) throw new Error('--poly must be between 1 and 10.');
+  if (!Number.isInteger(options.maxSounding) || options.maxSounding < 0 || options.maxSounding > 10) throw new Error('--max-sounding must be 0 (disabled) or an integer from 1 to 10.');
+  if (options.melody < 0 || options.melody > 10) throw new Error('--melody must be between 0 and 10.');
   if (output.toLowerCase() === input.toLowerCase()) throw new Error('Output must differ from the input audio file.');
   const { frames, onsets, cacheHit } = await modelOutput(input);
   const notes = extractNotes(frames, onsets, {
@@ -236,13 +280,14 @@ async function main() {
     maxPoly: options.poly, legato: options.legato, harmonic: options.harmonic,
     align: options.align, ghost: options.ghost, dynamics, splitAt: options.splitAt,
     minSounding: options.minSounding, legatoGap: options.legatoGap, preset: options.preset,
+    maxSounding: options.maxSounding, keyClean: options.keyClean, wobble: options.wobble, melody: options.melody,
   });
   writeFileSync(output, notesToMidi(piano, { splitHands }));
   const stats = { input, output, cacheHit, parameters: { ...options, dynamics, splitHands }, ...noteStats(piano) };
   if (json) console.log(JSON.stringify(stats));
   else {
     console.log(`Wrote ${output}`);
-    for (const [key, value] of Object.entries(noteStats(piano))) console.log(`${key}: ${Number.isInteger(value) ? value : value.toFixed(3)}`);
+    for (const [key, value] of Object.entries(noteStats(piano))) console.log(`${key}: ${typeof value === 'number' ? Number.isInteger(value) ? value : value.toFixed(3) : value ?? 'none'}`);
   }
 }
 
