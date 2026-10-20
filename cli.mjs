@@ -9,7 +9,7 @@ import { estimateKey, toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
-export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.7, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0, minSounding: 100, legatoGap: 0, maxSounding: 6, keyClean: 0.6, wobble: 0, melody: 3, preset: 'full' };
+export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.7, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0, minSounding: 100, legatoGap: 0, maxSounding: 6, keyClean: 0.6, wobble: 0, melody: 3, preset: 'full', quantize: true };
 
 export function noteStats(notes) {
   const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
@@ -162,6 +162,13 @@ export function noteStats(notes) {
     pctTimeSounding5plus: span ? 100 * crowdedTime / span : 0,
     wobblePairs,
     melodyJumpRate: melody.length > 1 ? melodyJumps / (melody.length - 1) : 0,
+    estimatedBpm: notes.estimatedBpm ?? 120,
+    gridDeviationMs: notes.gridDeviationMs ?? 0,
+    tempoConfidence: notes.tempoConfidence ?? 0,
+    phaseConfidence: notes.phaseConfidence ?? 0,
+    quantized: notes.quantized ?? false,
+    quantizedNotes: notes.quantizedNotes ?? 0,
+    timingOffsetSeconds: notes.timingOffsetSeconds ?? 0,
   };
 }
 
@@ -230,10 +237,10 @@ async function modelOutput(input) {
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes('--help')) {
-    const flags = Object.entries(defaults).map(([key, value]) => `[--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} ${value}]`).join(' ');
-    console.log(`Usage: node cli.mjs <audio file> [--out file.mid] ${flags} [--no-dynamics] [--no-split] [--json]`);
-    console.log('--preset accepts full or easy; easy defaults to --max-sounding 5 unless supplied explicitly. Set --min-sounding 0 or --legato-gap 0 to disable length smoothing.');
-    console.log('--max-sounding, --key-clean, --wobble and --melody accept 0 to disable their cleanup steps; --melody only affects Easy.');
+    const flags = Object.entries(defaults).filter(([key]) => key !== 'quantize').map(([key, value]) => `[--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} ${value}]`).join(' ');
+    console.log(`Usage: node cli.mjs <audio file> [--out file.mid] ${flags} [--no-dynamics] [--no-split] [--no-quantize] [--json]`);
+    console.log('--preset accepts full, easy or cover; their --max-sounding defaults are 6, 5 and 4. Set --min-sounding 0 or --legato-gap 0 to disable length smoothing.');
+    console.log('--max-sounding, --key-clean and --wobble accept 0 to disable their cleanup steps; --melody 0 restores highest-note selection in Easy/Cover. Quantization skips short clips and weak tempo estimates.');
     return;
   }
   const input = resolve(args.shift());
@@ -245,11 +252,12 @@ async function main() {
     const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
     if (arg === '--no-split') splitHands = false;
     else if (arg === '--no-dynamics') dynamics = false;
+    else if (arg === '--no-quantize') options.quantize = false;
     else if (arg === '--json') json = true;
     else if (arg === '--out') {
       if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error('--out needs a filename.');
       output = resolve(args[++i]);
-    } else if (arg.startsWith('--') && Object.hasOwn(options, key)) {
+    } else if (arg.startsWith('--') && key !== 'quantize' && Object.hasOwn(options, key)) {
       const value = key === 'preset' ? args[++i] : Number(args[++i]);
       if (key !== 'preset' && !Number.isFinite(value)) throw new Error(`${arg} needs a finite number.`);
       options[key] = value;
@@ -259,8 +267,8 @@ async function main() {
   for (const key of ['onset', 'frame', 'legato', 'harmonic', 'ghost', 'keyClean']) {
     if (options[key] < 0 || options[key] > 1) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be between 0 and 1.`);
   }
-  if (!['full', 'easy'].includes(options.preset)) throw new Error('--preset must be full or easy.');
-  if (options.preset === 'easy' && !maxSoundingSet) options.maxSounding = 5;
+  if (!['full', 'easy', 'cover'].includes(options.preset)) throw new Error('--preset must be full, easy or cover.');
+  if (!maxSoundingSet) options.maxSounding = { full: 6, easy: 5, cover: 4 }[options.preset];
   for (const key of ['align', 'minSounding', 'legatoGap', 'wobble']) {
     if (options[key] < 0) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be nonnegative.`);
   }
@@ -281,6 +289,7 @@ async function main() {
     align: options.align, ghost: options.ghost, dynamics, splitAt: options.splitAt,
     minSounding: options.minSounding, legatoGap: options.legatoGap, preset: options.preset,
     maxSounding: options.maxSounding, keyClean: options.keyClean, wobble: options.wobble, melody: options.melody,
+    quantize: options.quantize,
   });
   writeFileSync(output, notesToMidi(piano, { splitHands }));
   const stats = { input, output, cacheHit, parameters: { ...options, dynamics, splitHands }, ...noteStats(piano) };

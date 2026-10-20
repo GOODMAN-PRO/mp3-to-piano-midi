@@ -5,7 +5,8 @@ const { Midi } = midiPackage;
 
 export function notesToMidi(pianoNotes, { splitHands = true } = {}) {
   const midi = new Midi();
-  midi.header.setTempo(120);
+  const tempo = pianoNotes.estimatedBpm;
+  midi.header.setTempo(Number.isFinite(tempo) && tempo >= 60 && tempo <= 180 ? tempo : 120);
   const tracks = (splitHands ? ['Left hand', 'Right hand'] : ['Piano']).map(name => {
     const track = midi.addTrack();
     track.name = name;

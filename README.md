@@ -1,6 +1,6 @@
 # MP3 to Piano MIDI
 
-A browser-only MP3/audio converter using Spotify Basic Pitch. Audio stays on your device. The result is an approximate piano arrangement, especially for full mixes; it is not a score transcription. Exports use the 88-key range, piano instruments, no pitch bends, and a 120 BPM tempo event while preserving timing in seconds.
+A browser-only MP3/audio converter using Spotify Basic Pitch. Audio stays on your device. The result is an approximate piano arrangement, especially for full mixes; it is not a score transcription. Exports use the 88-key range, piano instruments, no pitch bends, and an estimated tempo when beat quantization is accepted (otherwise 120 BPM with original timing).
 
 ## Run
 
@@ -16,16 +16,17 @@ Open the URL printed by Vite, choose audio, press **Convert**, then **Download M
 
 ## Controls
 
-Automatic controls below are configurable through the CLI; the browser exposes the first six rows.
+Automatic controls below are configurable through the CLI; the browser exposes the first seven rows.
 
 | Control | What it does | Default |
 | --- | --- | --- |
-| Arrangement / `--preset` | Full keeps chords; Easy selects an upper voice and the lowest left-hand note per group, dropping attacks shorter than 120 ms before length adjustments. | `full` |
+| Arrangement / `--preset` | Full keeps chords; Easy tracks melody plus the lowest bass and drops attacks shorter than 120 ms; Cover tracks melody/bass with sparse chord tones. | `full` |
 | Sensitivity / `--onset` | Onset threshold. Lower detects more attacks. | `0.5` |
 | Note threshold / `--frame` | Frame threshold. Lower retains quieter sustain. | `0.3` |
 | Min note length / `--min` | Minimum detection length, in milliseconds. | `80` |
 | Max notes per chord / `--poly` | Keeps the loudest playable notes per original 30 ms attack group. | `6` |
 | Split hands / `--no-split` | Writes two piano tracks; disabling writes one without changing the arrangement. | On, automatic |
+| Snap to beat grid / `--no-quantize` | Estimates tempo and phase, snapping starts/ends to sixteenths with at least one sixteenth or 80 ms. Skips weak estimates and clips under 10 seconds. | On |
 | `--split-at` | Preferred hand boundary: `0` uses the median pitch clamped to MIDI 48–72; otherwise fixes the preferred pitch. | `0` |
 | `--tolerance` | Consecutive low-energy model frames tolerated during sustain (one frame ≈11.6 ms). | `11` |
 | `--legato` | Joins same-pitch fragments across gaps ≤80 ms when the later onset is weaker than this threshold. | `0.7` |
@@ -35,16 +36,16 @@ Automatic controls below are configurable through the CLI; the browser exposes t
 | Dynamics / `--no-dynamics` | Maps amplitude percentiles 5–95 to velocities 0.35–0.95, clamped to 0.1–1; constant amplitudes use 0.7. | On |
 | `--min-sounding` | Extends isolated short notes to this length, in milliseconds, before the sounding cap. | `100` |
 | `--legato-gap` | Fills gaps between single-note attacks in one hand, adding at most 150 ms per note. Disabled by default to allow releases. | `0` |
-| `--max-sounding` | Releases older sustains when a chord starts; prefers the incoming hand, then oldest/quietest notes. Protects the first 60 ms of each attack. | `6`; Easy `5` |
+| `--max-sounding` | Releases older sustains when a chord starts; prefers the incoming hand, then oldest/quietest notes. Protects the first 60 ms of each attack. | Full `6`; Easy `5`; Cover `4` |
 | `--key-clean` | Removes out-of-key notes shorter than 200 ms and below this fraction of the local median amplitude within ±1 second. Keeps long or strong chromatic notes. | `0.6` |
 | `--wobble` | Joins alternating semitone runs of singleton hand attacks within this many milliseconds; keeps the pitch with more note-time. Chords and nearby re-strikes are protected. | `0` (off) |
-| `--melody` | Easy only: penalizes jumps beyond seven semitones when selecting the upper voice, avoiding extra fragments. Zero restores highest-note selection. | `3` |
+| `--melody` | Positive enables the fixed-cost melody tracker in Easy/Cover; zero restores highest-note selection. The numeric flag is retained for compatibility. | `3` (on) |
 
-Set a cleanup/length option to `0` to disable it. `--no-dynamics` restores raw amplitudes clamped to 0.05–1. Easy's melody selection is a heuristic, not vocal isolation; real melodies can also leap.
+Set a cleanup/length option to `0` to disable it. `--no-dynamics` restores raw amplitudes clamped to 0.05–1. Tracking chooses one candidate from each nonempty hand group, so isolated wrong pitches can still force jumps; it is not vocal isolation. Full remains the default because Cover missed the five-song jump-rate and density targets.
 
 Each hand is limited to five notes spanning 14 semitones per 30 ms attack group. The boundary may move away from the preferred split; impossible chords lose the quietest offending notes. The sounding cap preserves new attacks and notes younger than 60 ms, so temporary excess polyphony is possible. Sustained notes can still exceed a hand's reach.
 
-A short note is isolated when no same-pitch note starts within 120 ms after its end. Extensions stop at least 1 ms before the next same-pitch note and are skipped if they would create an additional ≤50 ms fragment pair. Multi-note attacks within a hand skip gap-fill. Strong repeated notes stay separate; stronger fragment merging can also join some genuine softer re-strikes.
+A short note is isolated when no same-pitch note starts within 120 ms after its end. Extensions preserve re-strike spacing; multi-note hand attacks skip gap-fill. Beat quantization requires centered onset autocorrelation ≥0.12 and sixteenth-phase concentration ≥0.20. Unsafe re-strikes or newly unplayable groups keep their original relative timing; sounding-cap releases take priority over grid endings/minimums. A common phase shift aligns grid ticks, but does not identify the musical downbeat or meter. `--no-quantize` preserves original timing and 120 BPM.
 
 ## Command line
 
@@ -58,17 +59,17 @@ node cli.mjs --help
 
 Without `--out`, the MIDI is written beside the input. CPU inference can take several minutes. Model outputs are cached in `.cache/` by basename and size, checked against source path/mtime and model timestamp; parameter changes reuse inference. Delete the matching cache to force inference. Decoding is limited to 256 MiB of mono 22050 Hz float audio (about 50 minutes); split longer files first.
 
-`--json` writes one statistics object to stdout; progress goes to stderr. Statistics describe notes before MIDI quantization. Fragments count same-pitch gaps ≤50 ms, including genuine repeats; chord/hand metrics use anchored 30 ms groups. Sounding metrics cover first onset through last release, including internal silence. Key estimation correlates duration-weighted pitch classes with [Krumhansl–Schmuckler profiles](https://music21.org/music21docs/_modules/music21/analysis/discrete.html); outside the estimated major/natural-minor scale does not necessarily mean wrong. Wobble counts overlapping alternating semitone triples with ≤150 ms between singleton hand attacks; chords break runs. Melody jump rate is the fraction of right-hand group transitions exceeding seven semitones, following the highest pitch in each group. `harmonicPairsWeak` uses ratio 0.6 and `quietShortNotes` 0.35 regardless of settings. Duration percentiles use milliseconds; velocity percentiles use 0–1 units.
+`--json` writes statistics to stdout and progress to stderr. Statistics describe the final arrangement before MIDI tick rounding. Fragments count same-pitch gaps ≤50 ms, including real repeats; chord/hand metrics use anchored 30 ms groups. Sounding metrics cover first onset through last release. Key estimates use duration-weighted [Krumhansl–Schmuckler profiles](https://music21.org/music21docs/_modules/music21/analysis/discrete.html); out-of-key does not necessarily mean wrong. Wobble counts alternating singleton semitone triples ≤150 ms apart. Melody jump rate follows the highest right-hand pitch per group and counts intervals >7 semitones. `estimatedBpm` is the exported tempo; `gridDeviationMs` measures pre-snap starts against the candidate grid (120 BPM grid after rejection). `tempoConfidence` and `phaseConfidence` report the two guards; `quantizedNotes` counts starts accepted for snapping, and `timingOffsetSeconds` records the common shift. Duration percentiles use ms; velocities use 0–1.
 
-## Code map
+## How the arrangement is built
 
-`main.js` decodes/resamples browser audio and lazily reuses one model, with TensorFlow scopes and a WebGL-to-CPU fallback. `cli.mjs` provides ffmpeg decoding, local model loading, inference caching, and statistics. Both use the same three modules:
+After cleanup and playable hand assignment, Easy/Cover use dynamic programming over right-hand candidates: cost is negative amplitude normalized by the voice maximum, plus 0.08 per semitone travelled and 0.5 for a gap over one second. Ties prefer higher notes. Cover tracks bass similarly with weight 0.04 and lower-pitch ties, adding at most two in-key left-hand tones on the strongest 40% of original groups by summed amplitude. The sounding cap runs before and after guarded beat quantization to protect releases and avoid new fragments.
 
 - `extract.js`: model frames/onsets → timed notes; subtracts one frame from Basic Pitch's exclusive minimum-length cutoff and labels onset-less continuations with zero onset.
-- `piano.js`: range folding → overlap/fragment merge → harmonic/quiet/key cleanup → chord alignment → hand assignment and arrangement → chord cap → optional wobble merge → length smoothing → sounding cap → dynamics. Removed anchors trigger hand reassignment. Inputs are unchanged; array metadata carries `splitPoint` and `playabilityDrops`.
-- `midi.js`: hand-labelled notes → explicit ticks at 120 BPM. Same-tick same-pitch attacks coalesce, and earlier notes are clipped at later re-strikes so exports have positive lengths and no same-pitch overlaps, even across tracks.
+- `piano.js`: shared cleanup, voice tracking, tempo estimation, quantization, and dynamics. Removed anchors trigger regrouping. Inputs are unchanged; array metadata carries hand, tempo, and timing diagnostics.
+- `midi.js`: hand-labelled notes → explicit ticks at the estimated tempo. Same-tick same-pitch attacks coalesce; earlier notes are clipped at re-strikes to prevent zero lengths and overlaps across tracks.
 
-`test/piano.test.mjs` checks the shared pipeline, MIDI round trips, browser option passing, and edge cases. When changing defaults, update module arguments, CLI defaults, and corresponding HTML values together. TensorFlow is overridden to 4.22 in `package.json` because 3.21 had a WebGL concat-shader failure. No server is needed in production.
+`main.js` decodes browser audio and reuses one scoped model with WebGL-to-CPU fallback; `cli.mjs` handles ffmpeg, local inference caching, and statistics. `test/piano.test.mjs` checks the shared pipeline, MIDI round trips, and browser controls. Keep module/CLI/HTML defaults aligned. TensorFlow is overridden to 4.22 because 3.21 had a WebGL concat-shader failure. No server is needed in production.
 
 ## Getting the MIDI onto a Meta Quest 3
 

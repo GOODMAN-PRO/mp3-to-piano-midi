@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import midiPackage from '@tonejs/midi/build/Midi.js';
 import { extractNotes } from '../extract.js';
-import { estimateKey, toPianoNotes as pianoWithLengthDefaults } from '../piano.js';
+import { estimateKey, estimateTempo, quantizeNotes, trackVoice,
+  toPianoNotes as pianoWithLengthDefaults } from '../piano.js';
 import { notesToMidi } from '../midi.js';
 import { defaults, noteStats } from '../cli.mjs';
 
@@ -14,7 +15,8 @@ const note = (pitchMidi, startTimeSeconds = 0, durationSeconds = 1, amplitude = 
   ({ pitchMidi, startTimeSeconds, durationSeconds, amplitude });
 // Keep the original processing assertions isolated from the new optional stages.
 const pianoWithDefaults = (notes, options = {}) =>
-  pianoWithLengthDefaults(notes, { minSounding: 0, legatoGap: 0, maxSounding: 0, keyClean: 0, wobble: 0, melody: 0, ...options });
+  pianoWithLengthDefaults(notes, { minSounding: 0, legatoGap: 0, maxSounding: 0, keyClean: 0, wobble: 0,
+    melody: 0, quantize: false, ...options });
 const toPianoNotes = (notes, options = {}) =>
   pianoWithDefaults(notes, { align: 0, dynamics: false, ghost: 0, ...options })
     .map(({ hand, ...note }) => note);
@@ -231,7 +233,7 @@ assert.equal(noteStats(shiftedAnchor).handPolyViolations, 0);
 const lengthNotes = (notes, options = {}) => pianoWithLengthDefaults(notes, {
   legato: 0, harmonic: 0, align: 0, dynamics: false, ghost: 0, splitAt: 60,
   maxSounding: 0, keyClean: 0, wobble: 0, melody: 0, minSounding: 120,
-  legatoGap: options.preset === 'easy' ? 150 : 100, ...options,
+  legatoGap: options.preset === 'easy' ? 150 : 100, quantize: false, ...options,
 });
 const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-12,
   `${actual} differs from ${expected}`);
@@ -381,6 +383,31 @@ assert.equal(coherenceNotes(wobbleInput, { wobble: 150, splitAt: 61 }).length, 3
 assert.equal(coherenceNotes([note(60, 0, 0.08), note(61, 0.1, 0.12), note(60, 0.2, 0.08)],
   { wobble: 150 }).length, 3);
 
+// Voice selection considers the whole phrase, rather than taking each group's highest pitch.
+const voiceNote = (pitch, startTimeSeconds, amplitude = 1, durationSeconds = 0.2) =>
+  ({ pitch, startTimeSeconds, durationSeconds, amplitude });
+const voiceGroups = [[voiceNote(60, 0)], [voiceNote(62, 0.5), voiceNote(84, 0.5)], [voiceNote(64, 1)]];
+const voiceOriginal = structuredClone(voiceGroups);
+const voice = trackVoice(voiceGroups);
+assert.deepEqual(voice.map(n => n.pitch), [60, 62, 64]);
+assert.equal(voice[1], voiceGroups[1][0]);
+assert.deepEqual(voiceGroups, voiceOriginal);
+assert.deepEqual(trackVoice([[], ...voiceGroups, []]), voice);
+assert.deepEqual(trackVoice([]), []);
+// A future phrase resolves the first ambiguous chord; a greedy tracker would pick the louder low note.
+assert.deepEqual(trackVoice([
+  [voiceNote(60, 0, 1), voiceNote(72, 0, 0.9)], [voiceNote(72, 0.5)], [voiceNote(72, 1)],
+]).map(n => n.pitch), [72, 72, 72]);
+assert.deepEqual(trackVoice([[voiceNote(60, 0), voiceNote(72, 0)]]).map(n => n.pitch), [72]);
+assert.deepEqual(trackVoice([[voiceNote(48, 0), voiceNote(60, 0)]],
+  { intervalWeight: 0.04, preferHigher: false }).map(n => n.pitch), [48]);
+// Leaving a gap longer than one second carries the requested extra half-point cost.
+assert.deepEqual(trackVoice([
+  [voiceNote(60, 0, 1, 0.1), voiceNote(62, 0, 0.7, 1.5)], [voiceNote(62, 2)],
+]).map(n => n.pitch), [62, 62]);
+assert.deepEqual(trackVoice(voiceGroups.map(group => group.map(n => ({ ...n, amplitude: n.amplitude * 0.2 }))))
+  .map(n => n.pitch), voice.map(n => n.pitch));
+
 const melodyInput = [note(60, 0, 0.2), note(62, 1, 0.2), note(74, 1, 0.2)];
 const melodic = coherenceNotes(melodyInput, { preset: 'easy', melody: 3 });
 assert.deepEqual(melodic.map(n => n.pitch), [60, 62]);
@@ -388,13 +415,128 @@ assert.deepEqual(coherenceNotes(melodyInput, { preset: 'easy', melody: 0 }).map(
 assert.deepEqual(coherenceNotes(melodyInput, { preset: 'full', melody: 3 }).map(n => n.pitch), [60, 62, 74]);
 assert.equal(noteStats(melodic).melodyJumpRate, 0);
 const nearbyRepeat = [note(60, 0, 0.2), note(62, 0.7, 0.2), note(62, 0.94, 0.2), note(74, 0.94, 0.2)];
-assert.deepEqual(coherenceNotes(nearbyRepeat, { preset: 'easy', melody: 3 }).map(n => n.pitch), [60, 62, 74]);
+assert.deepEqual(coherenceNotes(nearbyRepeat, { preset: 'easy', melody: 3 }).map(n => n.pitch), [60, 62, 62]);
 const futureRepeat = [...melodyInput, note(62, 1.24, 0.2)];
-assert.deepEqual(coherenceNotes(futureRepeat, { preset: 'easy', melody: 3 }).map(n => n.pitch), [60, 74, 62]);
+assert.deepEqual(coherenceNotes(futureRepeat, { preset: 'easy', melody: 3 }).map(n => n.pitch), [60, 62, 62]);
 for (const input of [nearbyRepeat, futureRepeat]) {
-  assert.equal(noteStats(coherenceNotes(input, { preset: 'easy', melody: 3 })).fragments, 0);
+  assert.ok(noteStats(coherenceNotes(input, { preset: 'easy', melody: 3 })).fragments
+    <= noteStats(coherenceNotes(input, { preset: 'full' })).fragments);
 }
 assert.deepEqual(coherenceNotes(melodyInput, { preset: 'easy', melody: 3 }), melodic);
+
+// Cover gives chord tones only to the strongest 40% of groups, and excludes chromatic inner voices.
+const coverInput = Array.from({ length: 5 }, (_, i) => [48, 52, 55, 58, 72]
+  .map(pitch => note(pitch, i * 2, pitch === 58 ? 0.15 : 1, (i + 1) / 5))).flat();
+const coverOriginal = structuredClone(coverInput);
+assert.equal(estimateKey(coverInput).name, 'C major');
+const coverNotes = coherenceNotes(coverInput, { preset: 'cover', melody: 3 });
+for (let group = 0; group < 5; group++) {
+  const sounding = coverNotes.filter(n => n.startTimeSeconds === group * 2);
+  assert.deepEqual(sounding.filter(n => n.hand === 'right').map(n => n.pitch), [72]);
+  assert.deepEqual(sounding.filter(n => n.hand === 'left').map(n => n.pitch),
+    group < 3 ? [48] : [48, 52, 55]);
+  fitsHands(sounding);
+}
+assert.deepEqual(coverInput, coverOriginal);
+assert.ok(coverNotes.every(n => n.pitch !== 58));
+for (const pitch of [48, 72]) {
+  const oneHandCover = coherenceNotes([note(pitch, 0, 0.2), note(pitch, 2, 0.2)],
+    { preset: 'cover', melody: 3 });
+  assert.equal(oneHandCover.length, 2);
+  assert.ok(oneHandCover.every(n => n.hand === (pitch === 48 ? 'left' : 'right')));
+}
+assert.equal(coherenceNotes([], { preset: 'cover' }).length, 0);
+
+const clicks100 = Array.from({ length: 40 }, (_, i) => ({
+  ...voiceNote(60, 0.037 + i * 0.6, 1, 0.1), onset: 1,
+}));
+const clickTempo = estimateTempo(clicks100);
+assert.ok(Math.abs(clickTempo.estimatedBpm - 100) < 0.1);
+assert.ok(clickTempo.tempoConfidence > 0.9);
+assert.ok(Math.abs(clickTempo.gridPhaseSeconds - 0.037) < 0.005);
+assert.ok(clickTempo.gridDeviationMs < 1);
+assert.equal(clickTempo.eligible, true);
+assert.deepEqual(estimateTempo([]), estimateTempo([null]));
+for (const shortNotes of [clicks100.slice(0, 10), clicks100.slice(0, 10)
+  .map(n => ({ ...n, startTimeSeconds: n.startTimeSeconds + 3600 }))]) {
+  const shortTempo = estimateTempo(shortNotes);
+  assert.equal(shortTempo.estimatedBpm, 120);
+  assert.equal(shortTempo.eligible, false);
+}
+let randomState = 123;
+const irregularOnsets = Array.from({ length: 100 }, () => {
+  randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0;
+  return { ...voiceNote(60, randomState / 2 ** 32 * 30, 1, 0.1), onset: 1 };
+}).sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+const uncertainTempo = estimateTempo(irregularOnsets);
+assert.equal(uncertainTempo.estimatedBpm, 120);
+assert.equal(uncertainTempo.eligible, false);
+assert.ok(uncertainTempo.tempoConfidence < 0.12);
+// An enormous timestamp/span must fail closed, rather than allocate a giant onset curve.
+assert.equal(estimateTempo([voiceNote(60, 0, 1, 1e20)]).eligible, false);
+
+const internalNote = (pitch, startTimeSeconds, end, hand = 'right') =>
+  ({ pitch, startTimeSeconds, end, hand, amplitude: 0.8 });
+const exactGrid = { ...clickTempo, estimatedBpm: 100, gridPhaseSeconds: 0.037 };
+const offGrid = [internalNote(60, 1.002, 1.25), internalNote(64, 1.512, 1.7)];
+const offGridOriginal = structuredClone(offGrid);
+const snapped = quantizeNotes(offGrid, exactGrid);
+assert.equal(snapped.estimatedBpm, 100);
+assert.equal(snapped.quantized, true);
+close(snapped.timingOffsetSeconds, 0.037);
+assert.equal(snapped.notes.length, offGrid.length);
+for (const n of snapped.notes) {
+  close(n.startTimeSeconds / 0.15, Math.round(n.startTimeSeconds / 0.15));
+  close(n.end / 0.15, Math.round(n.end / 0.15));
+  assert.ok(n.end - n.startTimeSeconds >= 0.15 - 1e-12);
+}
+assert.deepEqual(offGrid, offGridOriginal);
+for (const guarded of [quantizeNotes(offGrid, exactGrid, { enabled: false }),
+  quantizeNotes(offGrid, uncertainTempo), quantizeNotes(offGrid, estimateTempo(clicks100.slice(0, 10)))]) {
+  assert.deepEqual(guarded.notes, offGrid);
+  assert.equal(guarded.estimatedBpm, 120);
+  assert.equal(guarded.quantized, false);
+}
+const fromInternal = notes => notes.map(({ end, ...n }) => ({ ...n, durationSeconds: end - n.startTimeSeconds }));
+const gridWithoutPhase = { ...exactGrid, gridPhaseSeconds: 0 };
+for (const repeated of [
+  [internalNote(60, 0.02, 0.06), internalNote(60, 0.08, 0.12)],
+  [internalNote(60, 0, 0.1), internalNote(60, 0.22, 0.3)],
+  [internalNote(60, 0, 0.4), internalNote(60, 0.52, 0.8)],
+]) {
+  const safeGrid = quantizeNotes(repeated, gridWithoutPhase).notes;
+  assert.equal(safeGrid.length, repeated.length);
+  assert.ok(safeGrid.every(n => n.end > n.startTimeSeconds));
+  assert.ok(safeGrid[0].end <= safeGrid[1].startTimeSeconds + 1e-12);
+  assert.ok(noteStats(fromInternal(safeGrid)).fragments <= noteStats(fromInternal(repeated)).fragments);
+}
+// Quantization must not combine two playable attacks into an unreachable chord.
+const wideGrid = quantizeNotes([internalNote(60, 0.02, 0.2), internalNote(84, 0.07, 0.25)], gridWithoutPhase);
+assert.equal(noteStats(fromInternal(wideGrid.notes)).handSpanViolations, 0);
+for (const preset of ['easy', 'cover']) {
+  const lineGrid = quantizeNotes([internalNote(60, 0.02, 0.2), internalNote(64, 0.07, 0.25)],
+    gridWithoutPhase, { preset });
+  assert.ok(lineGrid.notes[1].startTimeSeconds - lineGrid.notes[0].startTimeSeconds > 0.03);
+}
+const clickInput = clicks100.map(({ pitch, ...n }) => ({ ...n, pitchMidi: pitch }));
+const pipelineGrid = coherenceNotes(clickInput, { quantize: true });
+const pipelineUnquantized = coherenceNotes(clickInput, { quantize: false });
+assert.equal(pipelineGrid.quantized, true);
+assert.ok(Math.abs(pipelineGrid.estimatedBpm - 100) < 0.1);
+assert.equal(pipelineGrid.length, pipelineUnquantized.length);
+assert.equal(pipelineUnquantized.quantized, false);
+assert.equal(pipelineUnquantized.estimatedBpm, 120);
+assert.deepEqual(pipelineUnquantized.map(n => n.startTimeSeconds), clicks100.map(n => n.startTimeSeconds));
+assert.ok(noteStats(pipelineGrid).fragments <= noteStats(pipelineUnquantized).fragments);
+assert.equal(new midiPackage.Midi(notesToMidi(pipelineUnquantized)).header.tempos[0].bpm, 120);
+// The sounding cap can remove a fragment before snapping; quantization must preserve that improvement.
+const capGridInput = [withOnset(60, 0, 0.3, 1, 1), withOnset(62, 0.23, 0.27, 1, 1),
+  withOnset(60, 0.33, 0.27, 1, 1), ...Array.from({ length: 40 }, (_, i) => withOnset(48, 3 + i * 0.6, 0.2, 1, 1))];
+const capBeforeGrid = coherenceNotes(capGridInput, { maxSounding: 1, quantize: false });
+const capAfterGrid = coherenceNotes(capGridInput, { maxSounding: 1, quantize: true });
+assert.equal(capAfterGrid.quantized, true);
+assert.equal(noteStats(capBeforeGrid).fragments, 0);
+assert.equal(noteStats(capAfterGrid).fragments, 0);
 
 assert.deepEqual(extractNotes([], []), []);
 const frames = Array.from({ length: 35 }, (_, i) =>
@@ -470,6 +612,21 @@ const labelledSingleTrack = new midiPackage.Midi(notesToMidi([
 assert.equal(labelledSingleTrack.tracks.length, 1);
 assert.equal(labelledSingleTrack.tracks[0].notes.length, 2);
 
+const tempoNotes = Object.assign([
+  { pitch: 60, startTimeSeconds: 0.6, durationSeconds: 0.15, velocity: 0.8 },
+], { estimatedBpm: 100 });
+const tempoMidi = new midiPackage.Midi(notesToMidi(tempoNotes));
+close(tempoMidi.header.tempos[0].bpm, 100);
+const tempoMidiNote = tempoMidi.tracks.flatMap(track => track.notes)[0];
+assert.equal(tempoMidiNote.ticks, tempoMidi.header.ppq);
+assert.equal(tempoMidiNote.durationTicks, tempoMidi.header.ppq / 4);
+close(tempoMidiNote.time, 0.6);
+close(tempoMidiNote.duration, 0.15);
+for (const estimatedBpm of [undefined, NaN, Infinity, 0, 59, 181]) {
+  assert.equal(new midiPackage.Midi(notesToMidi(Object.assign([...tempoNotes], { estimatedBpm })))
+    .header.tempos[0].bpm, 120);
+}
+
 const readableMidi = notes => new midiPackage.Midi(notesToMidi(notes));
 assert.equal(readableMidi([]).tracks.reduce((sum, track) => sum + track.notes.length, 0), 0);
 // MIDI cannot represent separate re-strikes at the same tick; coalesce across hands.
@@ -506,7 +663,20 @@ assert.deepEqual(noteStats([]), {
   chordGroups: 0, meanChordSpreadMs: 0, velocityP5: 0, velocityP50: 0, velocityP95: 0, quietShortNotes: 0,
   leftNotes: 0, rightNotes: 0, handSpanViolations: 0, handPolyViolations: 0, splitPoint: 60, playabilityDrops: 0,
   keyEstimate: null, outOfKeyPct: 0, meanSounding: 0, pctTimeSounding5plus: 0, wobblePairs: 0, melodyJumpRate: 0,
+  estimatedBpm: 120, gridDeviationMs: 0, tempoConfidence: 0, phaseConfidence: 0,
+  quantized: false, quantizedNotes: 0, timingOffsetSeconds: 0,
 });
+const timedStats = noteStats(Object.assign(fromInternal(snapped.notes), {
+  estimatedBpm: snapped.estimatedBpm, gridDeviationMs: 12, tempoConfidence: 0.8,
+  phaseConfidence: 0.6, quantized: true, quantizedNotes: 2, timingOffsetSeconds: snapped.timingOffsetSeconds,
+}));
+assert.equal(timedStats.estimatedBpm, 100);
+assert.equal(timedStats.gridDeviationMs, 12); // Preserve the pre-quantization deviation in the final-note statistics.
+assert.equal(timedStats.tempoConfidence, 0.8);
+assert.equal(timedStats.phaseConfidence, 0.6);
+assert.equal(timedStats.quantized, true);
+assert.equal(timedStats.quantizedNotes, 2);
+close(timedStats.timingOffsetSeconds, 0.037);
 
 // Exact profile-shaped note-time gives a known key independent of amplitude and register.
 const majorProfile = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
@@ -684,7 +854,7 @@ try {
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const browserSource = readFileSync(new URL('../main.js', import.meta.url), 'utf8')
   .replace(/^import .*;\r?\n/gm, '').replace('import.meta.env.BASE_URL', '"/"');
-async function browserRun(preset, { empty = false, fail = false } = {}) {
+async function browserRun(preset, { empty = false, fail = false, quantize } = {}) {
   const elements = new Map();
   const element = selector => {
     if (!elements.has(selector)) {
@@ -695,6 +865,7 @@ async function browserRun(preset, { empty = false, fail = false } = {}) {
     return elements.get(selector);
   };
   element('#preset').value = preset;
+  if (quantize !== undefined) element('#quantize').checked = quantize;
   element('#file').files = [{ name: 'song.mp3', arrayBuffer: async () => new ArrayBuffer(0) }];
   let extractionOptions, pianoOptions, output;
   runInNewContext(browserSource, {
@@ -720,21 +891,31 @@ const cliExtraction = { onsetThresh: defaults.onset, frameThresh: defaults.frame
 const cliPiano = { maxPoly: defaults.poly, legato: defaults.legato, harmonic: defaults.harmonic,
   align: defaults.align, ghost: defaults.ghost, splitAt: defaults.splitAt, minSounding: defaults.minSounding,
   legatoGap: defaults.legatoGap, maxSounding: defaults.maxSounding, keyClean: defaults.keyClean,
-  wobble: defaults.wobble, melody: defaults.melody };
-for (const preset of ['full', 'easy']) {
+  wobble: defaults.wobble, melody: defaults.melody, quantize: defaults.quantize };
+const presetMarkup = html.match(/<select id="preset">([\s\S]*?)<\/select>/)[1];
+assert.deepEqual([...presetMarkup.matchAll(/<option[^>]*value="([^"]+)"/g)].map(match => match[1]),
+  ['full', 'easy', 'cover']);
+const presetTags = [...presetMarkup.matchAll(/<option[^>]*>/g)].map(match => match[0]);
+const selectedPresetTag = presetTags.find(tag => /\bselected\b/.test(tag)) ?? presetTags[0];
+assert.equal(selectedPresetTag.match(/value="([^"]+)"/)[1], defaults.preset);
+for (const preset of ['full', 'easy', 'cover']) {
   const browser = await browserRun(preset);
   assert.deepEqual({ ...browser.extractionOptions }, cliExtraction);
-  assert.deepEqual({ ...browser.pianoOptions }, { maxPoly: defaults.poly, preset });
+  assert.deepEqual({ ...browser.pianoOptions }, { maxPoly: defaults.poly, preset, quantize: defaults.quantize });
   const cliNotes = pianoWithLengthDefaults(extractNotes(frames, strongOnsets, {
     ...cliExtraction, energyTolerance: defaults.tolerance,
-  }), { ...cliPiano, maxSounding: preset === 'easy' ? 5 : defaults.maxSounding, preset });
+  }), { ...cliPiano, maxSounding: preset === 'cover' ? 4 : preset === 'easy' ? 5 : defaults.maxSounding, preset });
   assert.deepEqual(browser.output, cliNotes);
   assert.match(browser.element('#summary').textContent, new RegExp(`^${cliNotes.length} notes`));
   assert.equal(browser.element('#download').hidden, false);
   const empty = await browserRun(preset, { empty: true });
   assert.match(empty.element('#summary').textContent, /^0 notes/);
-  assert.match(empty.element('#status').textContent, preset === 'easy' ? /Try Full/ : /lowering the thresholds/);
+  assert.match(empty.element('#status').textContent, preset === 'full' ? /lowering the thresholds/ : /Try Full/);
 }
+const browserUnquantized = await browserRun('full', { quantize: false });
+assert.equal(browserUnquantized.pianoOptions.quantize, false);
+assert.equal(browserUnquantized.output.estimatedBpm, 120);
+assert.equal(browserUnquantized.output.quantized, false);
 assert.deepEqual(extractNotes(frames, strongOnsets), extractNotes(frames, strongOnsets, {
   ...cliExtraction, energyTolerance: defaults.tolerance,
 }));

@@ -41,6 +41,7 @@ form.addEventListener('submit', async event => {
   const maxPoly = Number(document.querySelector('#max-poly').value);
   const preset = document.querySelector('#preset').value;
   const splitHands = document.querySelector('#split').checked;
+  const quantize = document.querySelector('#quantize').checked;
   controls.disabled = true;
   convert.disabled = true;
   download.hidden = true;
@@ -113,7 +114,7 @@ form.addEventListener('submit', async event => {
     status.textContent = 'Creating piano MIDI…';
     failureMessage = 'Could not create the MIDI file. Try converting again.';
     const notes = extractNotes(frames, onsets, { onsetThresh, frameThresh, minMs });
-    const piano = toPianoNotes(notes, { maxPoly, preset });
+    const piano = toPianoNotes(notes, { maxPoly, preset, quantize });
 
     const blob = new Blob([notesToMidi(piano, { splitHands })], { type: 'audio/midi' });
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
@@ -122,10 +123,11 @@ form.addEventListener('submit', async event => {
     download.download = `${file.name.replace(/\.[^.]+$/, '')}.mid`;
     download.hidden = false;
     const duration = piano.reduce((end, note) => Math.max(end, note.startTimeSeconds + note.durationSeconds), 0);
-    summary.textContent = `${piano.length} notes · ${duration.toFixed(1)} seconds`;
+    summary.textContent = `${piano.length} notes · ${duration.toFixed(1)} seconds · ${piano.quantized
+      ? `${piano.estimatedBpm.toFixed(1)} BPM grid` : 'original timing'}`;
     progress.value = 1;
     status.textContent = piano.length ? 'Done. Your MIDI is ready.'
-      : preset === 'easy' ? 'No notes remain in Easy. Try Full or lower the thresholds.'
+      : preset !== 'full' ? `No notes remain in ${preset === 'cover' ? 'Cover' : 'Easy'}. Try Full or lower the thresholds.`
         : 'No notes remain. Try lowering the thresholds.';
   } catch (error) {
     console.error(error);

@@ -32,10 +32,184 @@ export function estimateKey(notes) {
   return best;
 }
 
+// One candidate per nonempty group; retain references so the caller can select the original notes.
+export function trackVoice(groups, { intervalWeight = 0.08, preferHigher = true } = {}) {
+  groups = groups.filter(group => group.length);
+  if (!groups.length) return [];
+  const amplitude = note => Math.max(0, Number.isFinite(note.amplitude) ? note.amplitude : 0.5);
+  const maximum = groups.reduce((max, group) => group.reduce((value, note) => Math.max(value, amplitude(note)), max), 0) || 1;
+  const end = note => note.end ?? note.startTimeSeconds + note.durationSeconds;
+  const preferred = (a, b) => preferHigher ? a.pitch > b.pitch : a.pitch < b.pitch;
+  const paths = [];
+  let costs = [];
+  for (let i = 0; i < groups.length; i++) {
+    const predecessors = [], next = groups[i].map(note => {
+      let best = -amplitude(note) / maximum, predecessor = -1;
+      if (i) {
+        best = Infinity;
+        for (let j = 0; j < groups[i - 1].length; j++) {
+          const previous = groups[i - 1][j];
+          const cost = costs[j] - amplitude(note) / maximum + intervalWeight * Math.abs(note.pitch - previous.pitch) +
+            (note.startTimeSeconds - end(previous) > 1 ? 0.5 : 0);
+          if (cost < best - 1e-9 || Math.abs(cost - best) <= 1e-9 &&
+            (predecessor < 0 || preferred(previous, groups[i - 1][predecessor]))) {
+            best = cost;
+            predecessor = j;
+          }
+        }
+      }
+      predecessors.push(predecessor);
+      return best;
+    });
+    paths.push(predecessors);
+    costs = next;
+  }
+  let chosen = 0;
+  for (let i = 1; i < costs.length; i++) if (costs[i] < costs[chosen] - 1e-9 ||
+    Math.abs(costs[i] - costs[chosen]) <= 1e-9 && preferred(groups.at(-1)[i], groups.at(-1)[chosen])) chosen = i;
+  const result = [];
+  for (let i = groups.length - 1; i >= 0; i--) {
+    result.push(groups[i][chosen]);
+    chosen = paths[i][chosen];
+  }
+  return result.reverse();
+}
+
+// A 10 ms onset curve keeps the autocorrelation small even for long recordings.
+export function estimateTempo(notes) {
+  const timed = notes.filter(note => Number.isFinite(note?.startTimeSeconds) && note.startTimeSeconds >= 0 &&
+    Number.isFinite(note.end ?? note.startTimeSeconds + note.durationSeconds) &&
+    (note.end ?? note.startTimeSeconds + note.durationSeconds) > note.startTimeSeconds);
+  const first = timed.reduce((start, note) => Math.min(start, note.startTimeSeconds), Infinity);
+  const seconds = timed.reduce((end, note) => Math.max(end, note.end ?? note.startTimeSeconds + note.durationSeconds), 0) - first;
+  const fallback = { estimatedBpm: 120, tempoConfidence: 0, phaseConfidence: 0, gridPhaseSeconds: 0,
+    gridDeviationMs: timed.length ? 1000 * timed.reduce((sum, note) => sum + Math.abs(note.startTimeSeconds -
+      Math.round(note.startTimeSeconds / 0.125) * 0.125), 0) / timed.length : 0, eligible: false };
+  // Bound direct callers as well as the CLI's roughly 50-minute decode limit.
+  if (seconds < 10 || seconds > 3600 || !Number.isFinite(seconds) || !timed.length) return fallback;
+  const bin = 0.01, curve = new Float64Array(Math.ceil(seconds / bin) + 4);
+  for (const note of timed) {
+    const strength = Math.max(0, Number.isFinite(note.amplitude) ? note.amplitude : 0.5) *
+      (Number.isFinite(note.onset) ? Math.max(0.05, note.onset) : 1);
+    const at = Math.round((note.startTimeSeconds - first) / bin);
+    for (let offset = -2; offset <= 2; offset++) if (at + offset >= 0 && at + offset < curve.length) {
+      curve[at + offset] += strength * (3 - Math.abs(offset)) / 3;
+    }
+  }
+  const average = curve.reduce((sum, value) => sum + value, 0) / curve.length;
+  for (let i = 0; i < curve.length; i++) curve[i] -= average;
+  const scores = new Map();
+  for (let lag = Math.floor(60 / 180 / bin); lag <= Math.ceil(60 / 60 / bin); lag++) {
+    let cross = 0, a = 0, b = 0;
+    for (let i = lag; i < curve.length; i++) {
+      cross += curve[i] * curve[i - lag];
+      a += curve[i] ** 2;
+      b += curve[i - lag] ** 2;
+    }
+    scores.set(lag, a && b ? cross / Math.sqrt(a * b) : 0);
+  }
+  let best = [...scores].sort((a, b) => b[1] - a[1])[0];
+  // Double/half-time ambiguity is common; prefer its ordinary practising range.
+  if (60 / (best[0] * bin) < 70 || 60 / (best[0] * bin) > 150) {
+    for (const factor of [0.5, 2]) {
+      const around = Math.round(best[0] * factor);
+      const candidate = [around - 1, around, around + 1].map(lag => [lag, scores.get(lag) ?? -1]).sort((a, b) => b[1] - a[1])[0];
+      const bpm = 60 / (candidate[0] * bin);
+      if (bpm >= 70 && bpm <= 150 && candidate[1] >= Math.max(0.12, best[1] * 0.6)) best = candidate;
+    }
+  }
+  const confidence = Math.max(0, best[1]);
+  if (confidence < 0.12) return { ...fallback, tempoConfidence: confidence };
+  const [lag, peak] = best, before = scores.get(lag - 1) ?? peak, after = scores.get(lag + 1) ?? peak;
+  const correction = before - 2 * peak + after ? Math.max(-0.5, Math.min(0.5, 0.5 * (before - after) / (before - 2 * peak + after))) : 0;
+  const centre = Math.max(60, Math.min(180, 60 / ((lag + correction) * bin)));
+  let bpm = centre, phase = 0, bestPhase = -Infinity;
+  // Refine the autocorrelation bin: a small BPM rounding error drifts across a song.
+  for (let p = -100; p <= 100; p++) {
+    const candidate = Math.max(60, Math.min(180, centre * (1 + p / 10000))), step = 60 / candidate / 4;
+    let real = 0, imaginary = 0, total = 0;
+    for (const note of timed) {
+      const weight = Math.max(0, Number.isFinite(note.amplitude) ? note.amplitude : 0.5) *
+        (Number.isFinite(note.onset) ? Math.max(0.05, note.onset) : 1);
+      const angle = 2 * Math.PI * (note.startTimeSeconds - first) / step;
+      real += weight * Math.cos(angle); imaginary += weight * Math.sin(angle); total += weight;
+    }
+    const score = total ? Math.hypot(real, imaginary) / total : 0;
+    if (score > bestPhase) {
+      bestPhase = score; bpm = candidate;
+      phase = ((Math.atan2(imaginary, real) / (2 * Math.PI) % 1 + 1) % 1) * step;
+    }
+  }
+  const step = 60 / bpm / 4;
+  phase = (phase + first) % step;
+  const deviation = timed.reduce((sum, note) => sum + Math.abs(note.startTimeSeconds - phase -
+    Math.round((note.startTimeSeconds - phase) / step) * step), 0) / timed.length;
+  if (bestPhase < 0.2) return { ...fallback, tempoConfidence: confidence, phaseConfidence: bestPhase };
+  return { estimatedBpm: bpm, tempoConfidence: confidence, phaseConfidence: bestPhase, gridPhaseSeconds: phase, gridDeviationMs: deviation * 1000, eligible: true };
+}
+
+export function quantizeNotes(notes, timing, { preset = 'full', enabled = true } = {}) {
+  const metadata = { ...timing, estimatedBpm: enabled && timing.eligible ? timing.estimatedBpm : 120,
+    quantized: false, quantizedNotes: 0, timingOffsetSeconds: 0 };
+  if (!enabled || !timing.eligible || !notes.length) return { ...metadata, notes: notes.map(note => ({ ...note })) };
+  const step = 60 / timing.estimatedBpm / 4, minimum = Math.max(step, 0.08);
+  const first = notes.reduce((start, note) => Math.min(start, note.startTimeSeconds), Infinity);
+  // Shift less than a sixteenth so exported beat ticks start at grid zero.
+  const offset = timing.gridPhaseSeconds <= first ? timing.gridPhaseSeconds : timing.gridPhaseSeconds - step;
+  const original = notes.map(note => ({ ...note, startTimeSeconds: note.startTimeSeconds - offset, end: note.end - offset }));
+  const result = original.map(note => {
+    const startTimeSeconds = Math.max(0, Math.round(note.startTimeSeconds / step) * step);
+    return { ...note, startTimeSeconds, end: Math.max(startTimeSeconds + minimum, Math.round(note.end / step) * step) };
+  });
+  const protectedNotes = new Set();
+  const protect = index => {
+    if (protectedNotes.has(index)) return false;
+    protectedNotes.add(index); result[index] = { ...original[index] }; return true;
+  };
+  let changed;
+  do {
+    changed = false;
+    const byPitch = new Map();
+    for (const i of original.map((_, i) => i).sort((a, b) => original[a].startTimeSeconds - original[b].startTimeSeconds)) {
+      const last = byPitch.get(result[i].pitch);
+      if (last !== undefined) {
+        const gap = result[i].startTimeSeconds - result[last].end;
+        const oldGap = original[i].startTimeSeconds - original[last].end;
+        if (gap < -1e-9 || oldGap > 0.05 + 1e-9 && gap <= 0.05 + 1e-9) {
+          // Keep re-strikes that cannot fit on the grid, rather than merge attacks.
+          const release = result[i].startTimeSeconds - step;
+          if (!protectedNotes.has(last) && release - result[last].startTimeSeconds >= minimum - 1e-9 &&
+            Math.abs(release / step - Math.round(release / step)) < 1e-7) result[last].end = release;
+          else { changed = protect(last) || changed; changed = protect(i) || changed; }
+        }
+      }
+      byPitch.set(result[i].pitch, i);
+    }
+    const order = result.map((_, i) => i).sort((a, b) => result[a].startTimeSeconds - result[b].startTimeSeconds);
+    for (let i = 0; i < order.length;) {
+      let end = i + 1;
+      while (end < order.length && result[order[end]].startTimeSeconds - result[order[i]].startTimeSeconds <= 0.03 + 1e-9) end++;
+      const group = order.slice(i, end);
+      for (const hand of ['left', 'right']) {
+        const voice = group.filter(index => result[index].hand === hand);
+        const pitches = voice.map(index => result[index].pitch);
+        const limit = preset === 'easy' ? 1 : preset === 'cover' ? hand === 'right' ? 1 : 3 : 5;
+        if (voice.length > limit || pitches.length && Math.max(...pitches) - Math.min(...pitches) > 14) {
+          for (const index of group) changed = protect(index) || changed;
+        }
+      }
+      i = end;
+    }
+  } while (changed);
+  return { ...metadata, notes: result.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds),
+    quantized: true, quantizedNotes: result.length - protectedNotes.size, timingOffsetSeconds: offset };
+}
+
 export function toPianoNotes(notes, {
   maxPoly = 6, legato = 0.7, harmonic = 0.6, align = 30, dynamics = true, ghost = 0.35, splitAt = 0,
   preset = 'full', minSounding = 100, legatoGap = 0,
-  maxSounding = preset === 'easy' ? 5 : 6, keyClean = 0.6, wobble = 0, melody = 3,
+  maxSounding = preset === 'cover' ? 4 : preset === 'easy' ? 5 : 6, keyClean = 0.6, wobble = 0, melody = 3,
+  quantize = true,
 } = {}) {
   const sorted = notes.filter(note => note && Number.isFinite(note.pitchMidi) &&
     Number.isFinite(note.startTimeSeconds) && note.startTimeSeconds >= 0 &&
@@ -156,11 +330,11 @@ export function toPianoNotes(notes, {
   const violations = hand => Number(hand.length > 5) +
     Number(hand.length > 1 && hand.at(-1).pitch - hand[0].pitch > 14);
   aligned.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+  const tempo = estimateTempo(aligned);
   let kept = aligned, previousCount, playabilityDrops = 0;
   do {
     previousCount = kept.length;
     const playable = new Set();
-    let previousRightPitch;
     for (let i = 0; i < kept.length;) {
       let end = i + 1;
       while (end < kept.length && kept[end].startTimeSeconds - kept[i].startTimeSeconds <= 0.03 + 1e-9) end++;
@@ -187,35 +361,17 @@ export function toPianoNotes(notes, {
           hand.splice(quietest, 1);
           playabilityDrops++;
         }
-        // Prefer the top voice, with a modest penalty for large Easy melody jumps.
-        let melodyNote = hand.at(-1);
-        if (h && preset === 'easy' && melody > 0 && previousRightPitch !== undefined && melodyNote &&
-          melodyNote.end - melodyNote.startTimeSeconds >= 0.12 - 1e-9) {
-          const score = note => note.pitch - melody * Math.max(0, Math.abs(note.pitch - previousRightPitch) - 7);
-          for (const candidate of [...hand].reverse()) {
-            if (candidate.end - candidate.startTimeSeconds < 0.12 - 1e-9) continue;
-            // Substituting an inner voice must not introduce another same-pitch fragment.
-            if (candidate !== hand.at(-1) && aligned.some(other => other !== candidate && other.pitch === candidate.pitch &&
-              (candidate.startTimeSeconds - other.end >= -1e-9 && candidate.startTimeSeconds - other.end <= 0.05 + 1e-9 ||
-               other.startTimeSeconds - candidate.end >= -1e-9 && other.startTimeSeconds - candidate.end <= 0.05 + 1e-9))) continue;
-            if (score(candidate) > score(melodyNote)) melodyNote = candidate;
-          }
-        }
-        const arrangement = preset === 'easy'
-          ? [h ? melodyNote : hand.at(0)].filter(note => note && note.end - note.startTimeSeconds >= 0.12 - 1e-9)
-          : hand;
-        if (h && arrangement.length) previousRightPitch = arrangement[0].pitch;
-        for (const note of arrangement) {
+        for (const note of hand) {
           note.hand = h ? 'right' : 'left';
-          note.chord = arrangement.length > 1;
+          note.chord = hand.length > 1;
           playable.add(note);
         }
       }
       i = end;
     }
-    // Apply the total cap to its original groups, after hand assignment.
+    // Full uses the total cap here; arrangements need every candidate before choosing voices.
     kept = chords.flatMap(chord => chord.filter(note => playable.has(note))
-      .sort((a, b) => b.amplitude - a.amplitude).slice(0, maxPoly))
+      .sort((a, b) => b.amplitude - a.amplitude).slice(0, preset === 'full' ? maxPoly : Infinity))
       .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
     if (wobble > 0) {
       const removed = new Set();
@@ -258,6 +414,47 @@ export function toPianoNotes(notes, {
     // A removed anchor can join neighbouring groups; reassign until no more notes disappear.
   } while (kept.length < previousCount);
 
+  if (preset === 'easy' || preset === 'cover') {
+    const scale = estimateKey(kept)?.scale ?? [];
+    let previousArrangement, strongNotes;
+    do {
+      previousArrangement = kept.length;
+      const groups = [];
+      for (let i = 0; i < kept.length;) {
+        let end = i + 1;
+        while (end < kept.length && kept[end].startTimeSeconds - kept[i].startTimeSeconds <= 0.03 + 1e-9) end++;
+        groups.push(kept.slice(i, end));
+        i = end;
+      }
+      const right = groups.map(group => group.filter(note => note.hand === 'right'));
+      const left = groups.map(group => group.filter(note => note.hand === 'left'));
+      const top = group => group.reduce((best, note) => !best || note.pitch > best.pitch ? note : best, null);
+      const bottom = group => group.reduce((best, note) => !best || note.pitch < best.pitch ? note : best, null);
+      const melodyLine = melody > 0 ? trackVoice(right) : right.map(top).filter(Boolean);
+      const bassLine = preset === 'cover' ? trackVoice(left, { intervalWeight: 0.04, preferHigher: false })
+        : left.map(bottom).filter(Boolean);
+      const chosen = new Set([...melodyLine, ...bassLine]);
+      if (preset === 'cover') {
+        // Rank the original groups once; removing notes must not promote a weak onset.
+        strongNotes ??= new Set(groups.map((group, i) => ({ i, strength: group.reduce((sum, note) => sum + note.amplitude, 0) }))
+          .sort((a, b) => b.strength - a.strength || a.i - b.i).slice(0, Math.ceil(groups.length * 0.4)).flatMap(group => groups[group.i]));
+        for (let i = 0; i < groups.length; i++) {
+          for (const note of left[i].filter(note => strongNotes.has(note) && !chosen.has(note) && scale.includes(note.pitch % 12))
+            .sort((a, b) => b.amplitude - a.amplitude || a.pitch - b.pitch).slice(0, 2)) chosen.add(note);
+        }
+      }
+      const voices = new Set([...melodyLine, ...bassLine]);
+      kept = groups.flatMap(group => group.filter(note => chosen.has(note) &&
+        (preset !== 'easy' || note.end - note.startTimeSeconds >= 0.12 - 1e-9))
+        .sort((a, b) => Number(voices.has(b)) - Number(voices.has(a)) || b.amplitude - a.amplitude).slice(0, maxPoly))
+        .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+      for (const group of groups) for (const note of group) {
+        note.chord = group.filter(other => chosen.has(other) && other.hand === note.hand).length > 1;
+      }
+      // Removing an early attack can join neighbouring groups; choose again until stable.
+    } while (kept.length < previousArrangement);
+  }
+
   const nextByPitch = new Map(), nextByHand = new Map();
   for (let i = kept.length - 1; i >= 0; i--) {
     const note = kept[i], originalEnd = note.end;
@@ -279,7 +476,8 @@ export function toPianoNotes(notes, {
     nextByHand.set(note.hand, note);
   }
 
-  if (maxSounding > 0) {
+  const releaseSustains = () => {
+    if (!(maxSounding > 0)) return;
     let sounding = [];
     for (let i = 0; i < kept.length;) {
       const start = kept[i].startTimeSeconds;
@@ -301,7 +499,12 @@ export function toPianoNotes(notes, {
       sounding = sounding.filter(note => note.end > start + 1e-9).concat(group);
       i = end;
     }
-  }
+  };
+  releaseSustains();
+  const timing = quantizeNotes(kept, tempo, { preset, enabled: quantize });
+  kept = timing.notes;
+  delete timing.notes;
+  releaseSustains();
 
   const amplitudes = kept.map(note => note.amplitude).sort((a, b) => a - b);
   const p5 = percentile(amplitudes, 0.05), p95 = percentile(amplitudes, 0.95);
@@ -316,5 +519,5 @@ export function toPianoNotes(notes, {
       : Math.min(1, Math.max(0.05, note.amplitude)),
     ...(note.onset === undefined ? {} : { onset: note.onset }),
   }));
-  return Object.assign(result, { splitPoint, playabilityDrops });
+  return Object.assign(result, { splitPoint, playabilityDrops, ...timing });
 }
