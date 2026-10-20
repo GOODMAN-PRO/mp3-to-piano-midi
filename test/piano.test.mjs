@@ -418,6 +418,15 @@ assert.deepEqual(restingGroups, restingOriginal);
 assert.deepEqual(trackMelody([]), []);
 assert.deepEqual(trackMelody([[], []]), []);
 assert.deepEqual(trackMelody([[], ...voiceGroups, []]).map(n => n.pitch), [60, 62, 64]);
+// Exercise the arrangement call sites too: the optional tracker must actually be wired in.
+for (const preset of ['easy', 'cover']) {
+  const phrase = coherenceNotes([
+    note(60, 0, 0.2, 1), note(84, 0.5, 0.2, 1), note(60, 1, 0.2, 1),
+  ], { preset, melody: 3 });
+  assert.deepEqual(phrase.filter(n => n.hand === 'right').map(n => n.pitch), [60, 60],
+    `${preset} must rest through the accompaniment detour`);
+  assert.ok(!phrase.some(n => n.startTimeSeconds > 0.2 && n.startTimeSeconds < 1));
+}
 // Exhaust all 36 choices on a tiny phrase, including rests; check the objective independently of the DP.
 const optionalGroups = [
   [voiceNote(60, 0, 1), voiceNote(72, 0, 0.9, 1.5)], [voiceNote(84, 0.5, 0.8)], [],
@@ -426,7 +435,7 @@ const optionalGroups = [
 const possibleLines = optionalGroups.reduce((lines, group) =>
   lines.flatMap(line => [line, ...group.map(n => [...line, n])]), [[]]);
 const melodyCost = line => {
-  let cost = (optionalGroups.length - line.length) * 0.6;
+  let cost = (optionalGroups.length - line.length) * 0.5;
   for (let i = 0; i < line.length; i++) {
     cost -= line[i].amplitude;
     if (i) cost += 0.08 * Math.abs(line[i].pitch - line[i - 1].pitch) +
@@ -435,6 +444,17 @@ const melodyCost = line => {
   return cost;
 };
 close(melodyCost(trackMelody(optionalGroups)), Math.min(...possibleLines.map(melodyCost)));
+// A modest skip-cost increase would turn these brief accompaniment pickups into repeated leaps.
+const multiplePhrases = Array.from({ length: 12 }, (_, phrase) => [
+  note(60, phrase * 0.6, 0.16, 1),
+  note(69, phrase * 0.6 + 0.2, 0.16, 0.89),
+  note(60, phrase * 0.6 + 0.4, 0.16, 1),
+]).flat();
+for (const preset of ['easy', 'cover']) {
+  const line = coherenceNotes(multiplePhrases, { preset, melody: 3 });
+  assert.ok(noteStats(line).melodyJumpRate <= 0.15, `${preset} must keep the phrase's continuity margin`);
+  assert.equal(line.filter(n => n.hand === 'right').length, 24);
+}
 
 const melodyInput = [note(60, 0, 0.2), note(62, 1, 0.2), note(74, 1, 0.2)];
 const melodic = coherenceNotes(melodyInput, { preset: 'easy', melody: 3 });
@@ -533,6 +553,32 @@ const octaveTempo = estimateTempo(octavePattern);
 assert.equal(octaveTempo.eligible, true);
 assert.ok(Math.abs(octaveTempo.estimatedBpm - 130) < 0.1);
 assert.ok(octaveTempo.phaseConfidence > 0.99);
+// These ratios bracket the octave gate, rather than merely testing an overwhelming advantage.
+const phaseConcentration = (notes, bpm) => {
+  let real = 0, imaginary = 0, total = 0;
+  for (const n of notes) {
+    const angle = 2 * Math.PI * n.startTimeSeconds / (60 / bpm / 4);
+    real += n.amplitude * Math.cos(angle);
+    imaginary += n.amplitude * Math.sin(angle);
+    total += n.amplitude;
+  }
+  return Math.hypot(real, imaginary) / total;
+};
+for (const [weakBeat, lowRatio, highRatio, expectedBpm] of [
+  [0.06, 1.2, 1.3, 65], [0.10, 1.4, 1.5, 65],
+  [0.14, 1.6, 1.7, 130], [0.16, 1.7, 2.0, 130],
+]) {
+  const weights = [1, weakBeat, 0, 0, 0.1, weakBeat, 0, 0];
+  const pattern = Array.from({ length: 256 }, (_, i) => ({
+    ...voiceNote(60, i * 60 / 130 / 4, weights[i % 8], 0.08), onset: 1,
+  })).filter(n => n.amplitude);
+  const ratio = phaseConcentration(pattern, 130) / phaseConcentration(pattern, 65);
+  assert.ok(ratio > lowRatio && ratio < highRatio, `phase ratio ${ratio}`);
+  const timing = estimateTempo(pattern);
+  assert.equal(timing.eligible, true);
+  assert.ok(Math.abs(timing.estimatedBpm - expectedBpm) < 0.1,
+    `phase ratio ${ratio.toFixed(3)} should choose ${expectedBpm} BPM`);
+}
 
 const internalNote = (pitch, startTimeSeconds, end, hand = 'right') =>
   ({ pitch, startTimeSeconds, end, hand, amplitude: 0.8 });
@@ -602,6 +648,96 @@ assert.equal(pipelineUnquantized.estimatedBpm, 120);
 assert.deepEqual(pipelineUnquantized.map(n => n.startTimeSeconds), clicks100.map(n => n.startTimeSeconds));
 assert.ok(noteStats(pipelineGrid).fragments <= noteStats(pipelineUnquantized).fragments);
 assert.equal(new midiPackage.Midi(notesToMidi(pipelineUnquantized)).header.tempos[0].bpm, 120);
+
+// A seeded, 24 s accepted-tempo fixture makes the Cover bass rules observable end to end.
+// Dense attacks are 180..220 ms apart, with weak pickups, longer harmony notes and changing chords.
+let bassSeed = 11;
+const bassRandom = () => ((bassSeed = (Math.imul(bassSeed, 1664525) + 1013904223) >>> 0) / 2 ** 32);
+const bassFixture = Array.from({ length: 40 }, (_, i) => withOnset(84, 0.037 + i * 0.6, 0.2, 1, 1));
+const bassCandidates = [];
+for (let i = 0; i < 120; i++) {
+  const start = 0.037 + Math.floor(i / 3) * 0.6 + 0.08 + i % 3 * 0.2 + (bassRandom() - 0.5) * 0.02;
+  let pitch = [36, 38, 40, 41, 43][i % 5];
+  let duration = 0.14 + 0.28 * bassRandom(), amplitude = 0.7 + 0.3 * bassRandom();
+  // The first beat distinguishes capped duration from uncapped note-time.
+  // The second beat's strongest attack repeats the still-held bass pitch class;
+  // its runner-up must win instead of rejecting the whole bucket.
+  if (i < 6) {
+    pitch = [36, 38, 40, 26, 40, 41][i];
+    duration = [1.2, 0.55, 0.14, 0.4, 0.25, 0.14][i];
+    amplitude = [0.55, 0.95, 0.72, 0.98, 0.85, 0.73][i];
+  }
+  const bass = withOnset(pitch, start, duration, amplitude, 0.3);
+  bassFixture.push(bass);
+  bassCandidates.push(bass);
+  if (i >= 6 && i % 3 !== 1) {
+    for (const tone of [47, 50]) bassFixture.push(withOnset(tone, start, 0.13, 0.35, 0.3));
+  }
+}
+const bassTiming = estimateTempo(bassFixture);
+assert.equal(bassTiming.eligible, true);
+assert.ok(Math.abs(bassTiming.estimatedBpm - 100) < 0.1);
+assert.ok(bassTiming.gridPhaseSeconds > 0.03 && bassTiming.gridPhaseSeconds < 0.05);
+const bassBeat = 60 / bassTiming.estimatedBpm;
+const bassBucket = start => Math.floor((start - bassTiming.gridPhaseSeconds) / bassBeat + 1e-9);
+const bassScore = n => n.amplitude * Math.min(n.durationSeconds, bassBeat);
+const bassIdentity = n => `${n.pitch ?? n.pitchMidi}:${n.amplitude}`;
+const bassOriginal = structuredClone(bassFixture);
+const bassOutputs = [];
+for (const quantize of [true, false]) {
+  const arranged = coherenceNotes(bassFixture, { preset: 'cover', melody: 3, quantize });
+  assert.equal(arranged.quantized, quantize);
+  const left = arranged.filter(n => n.hand === 'left');
+  const bass = left.filter(n => n.pitch < 44);
+  const originals = bass.map(n => bassCandidates.find(candidate => bassIdentity(candidate) === bassIdentity(n)));
+  assert.ok(originals.every(Boolean));
+  assert.equal(new Set(originals.map(n => bassBucket(n.startTimeSeconds))).size, bass.length,
+    'retain at most one original bass attack in each accepted-tempo bucket');
+  assert.equal(bass.length, 40);
+  assert.equal(new Set(bass.map(n => bassBucket(n.startTimeSeconds + arranged.timingOffsetSeconds))).size, bass.length,
+    'the fixture also has one final attack per beat after snapping');
+  let previous;
+  for (const selected of originals) {
+    const eligible = bassCandidates.filter(n => bassBucket(n.startTimeSeconds) === bassBucket(selected.startTimeSeconds) &&
+      !(previous && previous.pitchMidi % 12 === n.pitchMidi % 12 &&
+        previous.startTimeSeconds + previous.durationSeconds > n.startTimeSeconds));
+    assert.ok(eligible.includes(selected), 'no repeated bass pitch class while its predecessor still sounds');
+    assert.ok(eligible.every(n => bassScore(selected) >= bassScore(n) - 1e-9), 'keep the strongest eligible bass attack');
+    assert.ok(eligible.every(n => Math.abs(bassScore(selected) - bassScore(n)) > 1e-9 ||
+      selected.startTimeSeconds <= n.startTimeSeconds), 'score ties keep the earliest attack');
+    previous = selected;
+  }
+  assert.deepEqual(originals.slice(0, 2).map(n => n.pitchMidi), [38, 40]);
+  const attackGroups = [];
+  for (const n of left) {
+    const group = attackGroups.at(-1);
+    if (group && n.startTimeSeconds - group[0].startTimeSeconds <= 0.03 + 1e-9) group.push(n);
+    else attackGroups.push([n]);
+  }
+  assert.ok(attackGroups.filter(group => group.length > 1).length >= 8, 'exercise chord changes, not only isolated bass');
+  assert.ok(attackGroups.every(group => group.some(n => bass.includes(n))), 'chord tones need their retained bass attack');
+  for (let i = 1; i < bass.length; i++) {
+    assert.ok(bass[i - 1].pitch % 12 !== bass[i].pitch % 12 ||
+      bass[i - 1].startTimeSeconds + bass[i - 1].durationSeconds <= bass[i].startTimeSeconds,
+    'snapping must not turn these bass re-attacks into held pitch-class duplicates');
+  }
+  bassOutputs.push(left.map(bassIdentity));
+}
+assert.deepEqual(bassOutputs[0], bassOutputs[1], 'quantize changes timing, not selected basses or chord tones');
+assert.deepEqual(bassFixture, bassOriginal);
+// These two attacks straddle the accepted phase, although a zero-phase grid puts them in one beat.
+const phaseBoundaryBass = [
+  ...Array.from({ length: 40 }, (_, i) => withOnset(84, 0.037 + i * 0.6, 0.2, 1, 1)),
+  withOnset(36, 6.02, 0.13, 0.7, 0.3), withOnset(38, 6.2, 0.13, 1, 0.3),
+];
+const boundaryTempo = estimateTempo(phaseBoundaryBass);
+assert.equal(boundaryTempo.eligible, true);
+assert.ok(boundaryTempo.gridPhaseSeconds > 0.03 && boundaryTempo.gridPhaseSeconds < 0.05);
+for (const quantize of [true, false]) {
+  const arranged = coherenceNotes(phaseBoundaryBass, { preset: 'cover', melody: 3, quantize });
+  assert.deepEqual(arranged.filter(n => n.hand === 'left').map(n => n.pitch), [36, 38],
+    'bass buckets must use the accepted phase even when snapping is disabled');
+}
 // The sounding cap can remove a fragment before snapping; quantization must preserve that improvement.
 const capGridInput = [withOnset(60, 0, 0.3, 1, 1), withOnset(62, 0.23, 0.27, 1, 1),
   withOnset(60, 0.33, 0.27, 1, 1), ...Array.from({ length: 40 }, (_, i) => withOnset(48, 3 + i * 0.6, 0.2, 1, 1))];

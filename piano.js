@@ -86,8 +86,8 @@ export function trackVoice(groups, { intervalWeight = 0.08, preferHigher = true 
   return result.reverse();
 }
 
-// A skipped group costs 0.6. Subtracting that constant from every group makes
-// choosing a note a reward of 0.6 + amplitude; links may skip any number of groups.
+// A skipped group costs 0.5. Subtracting that constant from every group makes
+// choosing a note a reward of 0.5 + amplitude; links may skip any number of groups.
 export function trackMelody(groups) {
   const nodes = groups.flat();
   if (!nodes.length) return [];
@@ -102,7 +102,7 @@ export function trackMelody(groups) {
   for (const group of groups) {
     const first = at;
     for (const note of group) {
-      const reward = 0.6 + amplitude(note) / maximum;
+      const reward = 0.5 + amplitude(note) / maximum;
       let cost = -reward, predecessor = -1;
       for (const j of active) {
         const previous = nodes[j];
@@ -554,17 +554,27 @@ export function toPianoNotes(notes, options = {}) {
   }
 
   if (preset === 'cover') {
-    const beat = quantize && tempo.eligible ? 60 / tempo.estimatedBpm : 0.3;
-    const phase = quantize && tempo.eligible ? tempo.gridPhaseSeconds : 0;
+    const beat = tempo.eligible ? 60 / tempo.estimatedBpm : 0.3;
+    const phase = tempo.eligible ? tempo.gridPhaseSeconds : 0;
     const selectedLeft = new Set();
-    let previousBass, previousBeat, previousChord;
-    for (const note of kept.filter(note => arrangementBass.has(note))) {
+    let previousBass, previousChord;
+    const bassBeats = new Map();
+    for (const note of kept) if (arrangementBass.has(note)) {
       const bucket = Math.floor((note.startTimeSeconds - phase) / beat + 1e-9);
-      if (bucket === previousBeat || previousBass && previousBass.pitch % 12 === note.pitch % 12 &&
-        previousBass.end > note.startTimeSeconds) continue;
-      selectedLeft.add(note);
-      previousBeat = bucket;
-      previousBass = note;
+      if (!bassBeats.has(bucket)) bassBeats.set(bucket, []);
+      bassBeats.get(bucket).push(note);
+    }
+    // Pick the strongest sustained bass in each beat; a weak pickup need not win.
+    const bassWeight = note => note.amplitude * Math.min(note.end - note.startTimeSeconds, beat);
+    for (const attacks of bassBeats.values()) {
+      const pick = attacks.sort((a, b) => Math.abs(bassWeight(b) - bassWeight(a)) > 1e-9
+        ? bassWeight(b) - bassWeight(a) : a.startTimeSeconds - b.startTimeSeconds)
+        .find(note => !(previousBass && previousBass.pitch % 12 === note.pitch % 12 &&
+          previousBass.end > note.startTimeSeconds));
+      if (pick) {
+        selectedLeft.add(pick);
+        previousBass = pick;
+      }
     }
     for (let i = 0; i < kept.length;) {
       let end = i + 1;
