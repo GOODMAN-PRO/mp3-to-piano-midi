@@ -20,7 +20,7 @@ Automatic controls below are configurable through the CLI; the browser exposes t
 
 | Control | What it does | Default |
 | --- | --- | --- |
-| Arrangement / `--preset` | Cover follows a melody that can rest, with bass and sparse chord changes. Easy keeps melody plus the lowest bass and drops attacks shorter than 120 ms. Full keeps transcription chords. | `cover` |
+| Arrangement / `--preset` | Cover follows a melody that can rest, with bass and sparse chord changes. Easy keeps melody plus the lowest bass and drops attacks shorter than 120 ms, except lone left-hand attacks during melody rests. Full keeps transcription chords. | `cover` |
 | Sensitivity / `--onset` | Onset threshold. Lower detects more attacks. | `0.5` |
 | Note threshold / `--frame` | Frame threshold. Lower retains quieter sustain. | `0.3` |
 | Min note length / `--min` | Minimum detection length, in milliseconds. | `80` |
@@ -63,7 +63,7 @@ Without `--out`, the MIDI is written beside the input. CPU inference can take se
 
 ## How the arrangement is built
 
-After cleanup and playable hand assignment, Easy/Cover track right-hand candidates with cost −amplitude/voice maximum + 0.08 per semitone travelled + 0.5 for a gap over one second; skipping a group costs 0.5. The tracker can therefore rest instead of borrowing accompaniment during melody gaps. Cover's bass tracker still chooses from every available group with interval weight 0.04 and lower-pitch ties, then retains at most one bass attack per accepted beat (300 ms when no tempo is accepted), choosing the largest amplitude × duration capped at one beat, with earlier attacks winning ties. It tries candidates in that order while avoiding same-pitch-class re-attacks during a bass sustain. Turning off grid snapping preserves this selection. At retained bass attacks, changed left-hand pitch-class sets may add at most two in-key tones from the strongest 40% of original groups. The sounding cap runs before and after guarded quantization.
+After cleanup and playable hand assignment, Easy/Cover track right-hand candidates with cost −amplitude/voice maximum + 0.08 per semitone travelled + 0.5 for a gap over one second; skipping a group costs 0.5. The tracker can therefore rest instead of borrowing accompaniment during melody gaps. Cover's bass tracker still chooses from every available group with interval weight 0.04 and lower-pitch ties, then retains at most one accompaniment bass attack per accepted beat (300 ms when no tempo is accepted), choosing the largest amplitude × duration capped at one beat, with earlier attacks winning ties. It tries candidates in that order while avoiding same-pitch-class re-attacks during a bass sustain. Both arrangements preserve original singleton left-hand attacks when the final right-hand melody is silent: these may be the tune crossing the hand split, so they keep their hand labels and bypass bass thinning and Easy's short-note filter. Turning off grid snapping preserves this selection. At retained bass attacks, changed left-hand pitch-class sets may add at most two in-key tones from the strongest 40% of original groups. The sounding cap runs before and after guarded quantization.
 
 - `extract.js`: model frames/onsets → timed notes; subtracts one frame from Basic Pitch's exclusive minimum-length cutoff and labels onset-less continuations with zero onset.
 - `piano.js`: shared cleanup, voice tracking, tempo estimation, quantization, and dynamics. Removed anchors trigger regrouping. Inputs are unchanged; array metadata carries hand, tempo, and timing diagnostics.

@@ -510,10 +510,10 @@ export function toPianoNotes(notes, options = {}) {
     // A removed anchor can join neighbouring groups; reassign until no more notes disappear.
   } while (kept.length < previousCount);
 
-  let arrangementBass;
+  let arrangementBass, loneLeft;
   if (preset === 'easy' || preset === 'cover') {
     const scale = estimateKey(kept)?.scale ?? [];
-    let previousArrangement, strongNotes;
+    let previousArrangement, strongNotes, loneCandidates;
     do {
       previousArrangement = kept.length;
       const groups = [];
@@ -523,6 +523,8 @@ export function toPianoNotes(notes, options = {}) {
         groups.push(kept.slice(i, end));
         i = end;
       }
+      // Freeze original solos: pruning a chord must not make its bass a solo.
+      loneCandidates ??= groups.filter(group => group.length === 1 && group[0].hand === 'left').map(group => group[0]);
       const right = groups.map(group => group.filter(note => note.hand === 'right'));
       const left = groups.map(group => group.filter(note => note.hand === 'left'));
       const top = group => group.reduce((best, note) => !best || note.pitch > best.pitch ? note : best, null);
@@ -551,12 +553,17 @@ export function toPianoNotes(notes, options = {}) {
       }
       // Removing an early attack can join neighbouring groups; choose again until stable.
     } while (kept.length < previousArrangement);
+    // Keep a solo crossing the split in its original hand. Use the final melody:
+    // Easy's short-note filter and later tracker passes can open additional rests.
+    loneLeft = new Set(loneCandidates.filter(note => !kept.some(other => other.hand === 'right' &&
+      other.startTimeSeconds <= note.startTimeSeconds + 1e-9 && other.end > note.startTimeSeconds + 1e-9)));
+    kept = [...new Set([...kept, ...loneLeft])].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
   }
 
   if (preset === 'cover') {
     const beat = tempo.eligible ? 60 / tempo.estimatedBpm : 0.3;
     const phase = tempo.eligible ? tempo.gridPhaseSeconds : 0;
-    const selectedLeft = new Set();
+    const selectedLeft = new Set(loneLeft);
     let previousBass, previousChord;
     const bassBeats = new Map();
     for (const note of kept) if (arrangementBass.has(note)) {

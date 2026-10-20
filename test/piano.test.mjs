@@ -494,6 +494,72 @@ for (const pitch of [48, 72]) {
   assert.ok(oneHandCover.every(n => n.hand === (pitch === 48 ? 'left' : 'right')));
 }
 assert.equal(coherenceNotes([], { preset: 'cover' }).length, 0);
+// A lone tune may cross the adaptive hand split. Its low notes are still the tune,
+// even when two of them share a bass beat bucket. Rounded note-list repro needs no inference.
+const crossingSplitLine = [
+  [60, 0.0232, 0.8940, 0.5752, 0.6313], [62, 0.9985, 0.9404, 0.5771, 0.6813],
+  [64, 1.9982, 0.9288, 0.5632, 0.6504], [65, 3.0083, 0.9288, 0.5554, 0.3559],
+  [67, 3.9964, 0.9520, 0.5594, 0.5975], [65, 5.0065, 0.9288, 0.5536, 0.6547],
+  [64, 5.9946, 0.9404, 0.5571, 0.6350], [62, 7.0047, 0.9288, 0.5688, 0.6085],
+  [60, 7.9928, 0.9404, 0.5718, 0.6777], [64, 8.9913, 0.9417, 0.5522, 0.7239],
+  [67, 9.9910, 0.9404, 0.5594, 0.7521], [72, 11.0011, 0.9172, 0.5736, 0.5098],
+].map(args => withOnset(...args));
+const crossingSplitOriginal = structuredClone(crossingSplitLine);
+for (const preset of ['cover', 'easy']) for (const quantize of [true, false]) {
+  const arranged = pianoWithLengthDefaults(crossingSplitLine, { preset, quantize });
+  assert.equal(arranged.splitPoint, 64);
+  assert.equal(arranged.quantized, quantize);
+  assert.deepEqual(arranged.map(n => n.pitch), crossingSplitLine.map(n => n.pitchMidi),
+    `${preset} must retain every attack of a lone line crossing the split`);
+  assert.equal(arranged.filter(n => n.hand === 'left').length, 4);
+}
+assert.deepEqual(crossingSplitLine, crossingSplitOriginal);
+// The same guarantee applies without an accepted tempo, including a stronger bass-bucket rival.
+const quickLoneLine = [60, 62, 64, 65, 67, 65, 64, 62, 60, 64, 67, 72]
+  .map((pitch, i) => withOnset(pitch, i * 0.22, 0.16, i === 1 ? 1 : 0.6, 1));
+for (const preset of ['cover', 'easy']) {
+  assert.deepEqual(pianoWithLengthDefaults(quickLoneLine, { preset }).map(n => n.pitch),
+    quickLoneLine.map(n => n.pitchMidi));
+  const shortLone = coherenceNotes([note(48, 0, 0.08), note(72, 1, 0.2)],
+    { preset, melody: 3 });
+  assert.deepEqual(shortLone.map(n => n.pitch), [48, 72], 'Easy must not erase a short lone-line attack');
+  const heldLoneClass = coherenceNotes([note(48, 0, 1), note(60, 0.4, 0.2)],
+    { preset, splitAt: 72, melody: 3 });
+  assert.deepEqual(heldLoneClass.map(n => n.pitch), [48, 60],
+    'a lone line is exempt from the still-sounding bass pitch-class rule');
+}
+// A real bass under a held melody remains left-handed and remains eligible for thinning.
+const accompaniedBass = [0, 1].flatMap((start, i) => [
+  note(72 + i * 2, start, 0.8, 1),
+  note(48 + i * 4, start + 0.05, 0.16, 0.4),
+  note(50 + i * 3, start + 0.15, 0.3, 1),
+]);
+for (const preset of ['cover', 'easy']) {
+  const arranged = coherenceNotes(accompaniedBass, { preset, splitAt: 60, melody: 3 });
+  assert.deepEqual(arranged.filter(n => n.hand === 'right').map(n => n.pitch), [72, 74]);
+  assert.ok(arranged.filter(n => n.pitch < 60).every(n => n.hand === 'left'),
+    'bass notes sounding under a real melody must not be promoted to the melody hand');
+  assert.deepEqual(arranged.filter(n => n.hand === 'left').map(n => n.pitch),
+    preset === 'cover' ? [50, 53] : [48, 50, 52, 53],
+    'a held melody must prevent the lone-line exemption from bypassing bass thinning');
+}
+const prunedChord = coherenceNotes([
+  note(48, 0, 0.15, 0.4), note(52, 0.02, 0.15, 0.6),
+  note(72, 0.1, 1, 1), note(50, 0.2, 0.3, 1),
+], { preset: 'cover', splitAt: 60, maxPoly: 1, melody: 3 });
+assert.deepEqual(prunedChord.map(n => n.pitch), [72, 50],
+  'a chord member must not gain lone-line protection when a previous selection removes its partner');
+const discardedRight = coherenceNotes([
+  note(72, 0, 0.1), note(48, 0.04, 0.08), note(74, 1, 0.2),
+], { preset: 'easy', splitAt: 60, melody: 3 });
+assert.deepEqual(discardedRight.map(n => n.pitch), [48, 74],
+  'a right-hand note that Easy discards must not hide the remaining lone left-hand attack');
+const changedMelody = coherenceNotes([
+  note(60, 0, 0.2, 1), note(48, 0.07, 0.08, 1),
+  note(70, 0.5, 0.1, 1), note(80, 1, 0.2, 1),
+], { preset: 'easy', splitAt: 60, melody: 3 });
+assert.deepEqual(changedMelody.map(n => n.pitch), [48, 80],
+  'lone-line protection must use the final melody after Easy removes a short bridging note');
 // Without an accepted grid Cover allows one bass attack per 300 ms, without thinning the melody.
 const busyBass = [0, 0.1, 0.31, 0.4].flatMap((start, i) => [
   note([48, 50, 52, 53][i], start, 0.2), note([72, 74, 76, 77][i], start, 0.2),
@@ -653,7 +719,9 @@ assert.equal(new midiPackage.Midi(notesToMidi(pipelineUnquantized)).header.tempo
 // Dense attacks are 180..220 ms apart, with weak pickups, longer harmony notes and changing chords.
 let bassSeed = 11;
 const bassRandom = () => ((bassSeed = (Math.imul(bassSeed, 1664525) + 1013904223) >>> 0) / 2 ** 32);
-const bassFixture = Array.from({ length: 40 }, (_, i) => withOnset(84, 0.037 + i * 0.6, 0.2, 1, 1));
+// Hold the melody across every bass candidate: otherwise a bass-only attack in a melody rest
+// deliberately gets the lone-line exemption instead of the accompaniment thinning rules below.
+const bassFixture = Array.from({ length: 40 }, (_, i) => withOnset(84, 0.037 + i * 0.6, 0.58, 1, 1));
 const bassCandidates = [];
 for (let i = 0; i < 120; i++) {
   const start = 0.037 + Math.floor(i / 3) * 0.6 + 0.08 + i % 3 * 0.2 + (bassRandom() - 0.5) * 0.02;
@@ -727,7 +795,7 @@ assert.deepEqual(bassOutputs[0], bassOutputs[1], 'quantize changes timing, not s
 assert.deepEqual(bassFixture, bassOriginal);
 // These two attacks straddle the accepted phase, although a zero-phase grid puts them in one beat.
 const phaseBoundaryBass = [
-  ...Array.from({ length: 40 }, (_, i) => withOnset(84, 0.037 + i * 0.6, 0.2, 1, 1)),
+  ...Array.from({ length: 40 }, (_, i) => withOnset(84, 0.037 + i * 0.6, 0.59, 1, 1)),
   withOnset(36, 6.02, 0.13, 0.7, 0.3), withOnset(38, 6.2, 0.13, 1, 0.3),
 ];
 const boundaryTempo = estimateTempo(phaseBoundaryBass);
