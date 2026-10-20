@@ -8,6 +8,8 @@ import * as tf from '@tensorflow/tfjs';
 import { extractNotes } from './extract.js';
 import { estimateKey, pianoDefaults, defaultMaxSounding, toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
+import { arrangeStems, stemsDefaults } from './stems.js';
+export { stemsDefaults } from './stems.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const { onsetThresh, frameThresh, minMs, energyTolerance, maxPoly, ...arrangementDefaults } = pianoDefaults;
@@ -229,6 +231,7 @@ export function noteStats(notes) {
     melodyLeftShare: melodyTime ? melodyLeftTime / melodyTime : 0,
     melodyMetricSource: labelled ? 'role' : 'highest-right-hand-estimate',
     vocalMedianPitch: notes.vocalMedianPitch ?? null,
+    melodyMedianPitch: notes.melodyMedianPitch ?? null,
     accompanimentAttacksPerSec: perHand.left.accompanimentAttacksPerSec + perHand.right.accompanimentAttacksPerSec,
     perHand,
     clashPct: melodyTime ? 100 * clashTime / melodyTime : 0,
@@ -315,7 +318,6 @@ const separationModel = {
   sha256: 'ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b',
   url: 'https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_2.onnx',
 };
-export const stemsDefaults = { theta: 0.65, splitDb: 6, lhGroove: 0.6, rhLegato: 350 };
 const secondsSince = start => (performance.now() - start) / 1000;
 const hash = data => createHash('sha256').update(data).digest('hex');
 
@@ -500,7 +502,7 @@ async function stemsOutput(input, options) {
     timings.basicPitch = secondsSince(start);
     mkdirSync(cacheDir, { recursive: true });
     // Keep the frozen-default melody in the inference cache, even after a tuned first run.
-    const defaultMelody = tuned ? melodyNotes(vocal22) : melody;
+    const defaultMelody = tuned ? melodyNotes(vocal22, stemsDefaults) : melody;
     const record = { input, mtimeMs: source.mtimeMs, modelStamp, pipelineHash, modelHash: separationModel.sha256,
       melody: defaultMelody, frames, onsets, duration: instrumental22.length / 22050, provider, stemPaths, stemHashes, timings };
     const temporary = `${cachePath}.${process.pid}.tmp`;
@@ -520,7 +522,8 @@ async function stemsOutput(input, options) {
 export async function convertFile(input, options = {}) {
   input = resolve(input);
   const maxSoundingSet = options.maxSounding !== undefined;
-  options = { ...defaults, ...stemsDefaults, ...options };
+  options = { ...defaults, ...stemsDefaults,
+    ...Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined)) };
   if (!maxSoundingSet) options.maxSounding = defaultMaxSounding(options.preset);
   const start = performance.now();
   const data = options.classic ? await modelOutput(input) : await stemsOutput(input, options);
@@ -531,7 +534,7 @@ export async function convertFile(input, options = {}) {
   });
   const extraction = secondsSince(extractionStart), arrangementStart = performance.now();
   const piano = options.classic ? toPianoNotes(notes, { ...options, maxPoly: options.poly })
-    : (await import('./stems.js')).arrangeStems(data.melody, notes, { ...options, durationSeconds: data.duration });
+    : arrangeStems(data.melody, notes, { ...options, durationSeconds: data.duration });
   const timings = { ...data.timings, extraction, arrangement: secondsSince(arrangementStart), total: secondsSince(start) };
   return { piano, midi: notesToMidi(piano, { splitHands: options.splitHands !== false }),
     stats: { input, mode: options.classic ? 'classic' : 'stems', cacheHit: data.cacheHit,
@@ -545,7 +548,8 @@ async function main() {
     const flags = Object.entries(defaults).filter(([, value]) => typeof value !== 'boolean').map(([key, value]) => `[--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} ${value}]`).join(' ');
     console.log(`Usage: node cli.mjs <audio file> [--classic] [--ep dml|cpu] [--keep-stems dir] [--out file.mid] ${flags} [--no-dynamics] [--no-split] [--no-quantize] [--json]`);
     console.log('Default: separate vocals for the melody in its natural register; arrange instrumental backing in the other hand. --classic keeps the full-mix pipeline.');
-    console.log('Stems controls: --theta 0.65 --split-db 6 --lh-groove 0.6 --rh-legato 350 (ms). --chords-only disables pulses.');
+    console.log(`Stems controls: --theta ${stemsDefaults.theta} --split-db ${stemsDefaults.splitDb} --lh-groove ${stemsDefaults.lhGroove} --rh-legato ${stemsDefaults.rhLegato} (ms). --chords-only disables pulses.`);
+    console.log('Melody controls: --melody-hand auto|left|right --melody-octave -1|0|1. Auto keeps the register rule.');
     console.log(`--preset accepts full, easy or cover; their --max-sounding defaults are ${['full', 'easy', 'cover'].map(defaultMaxSounding).join(', ')}. Set --min-sounding 0 or --legato-gap 0 to disable length smoothing.`);
     console.log('--max-sounding, --key-clean and --wobble accept 0 to disable their cleanup steps; --melody 0 restores highest-note selection in Easy/Cover. Quantization skips short clips and weak tempo estimates.');
     return;
@@ -571,8 +575,9 @@ async function main() {
       if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error('--out needs a filename.');
       output = resolve(args[++i]);
     } else if (arg.startsWith('--') && typeof options[key] !== 'boolean' && Object.hasOwn(options, key)) {
-      const value = key === 'preset' ? args[++i] : Number(args[++i]);
-      if (key !== 'preset' && !Number.isFinite(value)) throw new Error(`${arg} needs a finite number.`);
+      const string = key === 'preset' || key === 'melodyHand';
+      const value = string ? args[++i] : Number(args[++i]);
+      if (!string && !Number.isFinite(value)) throw new Error(`${arg} needs a finite number.`);
       options[key] = value;
       if (key === 'maxSounding') maxSoundingSet = true;
     } else throw new Error(`Unknown argument: ${arg}`);
@@ -593,6 +598,8 @@ async function main() {
   if (!Number.isInteger(options.maxSounding) || options.maxSounding < 0 || options.maxSounding > 10) throw new Error('--max-sounding must be 0 (disabled) or an integer from 1 to 10.');
   if (options.melody < 0 || options.melody > 10) throw new Error('--melody must be between 0 and 10.');
   if (options.ep && !['dml', 'cpu'].includes(options.ep)) throw new Error('--ep must be dml or cpu.');
+  if (!['auto', 'left', 'right'].includes(options.melodyHand)) throw new Error('--melody-hand must be auto, left or right.');
+  if (![-1, 0, 1].includes(options.melodyOctave)) throw new Error('--melody-octave must be -1, 0 or 1.');
   for (const key of ['theta', 'splitDb', 'lhGroove', 'rhLegato']) {
     if (options[key] < 0) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be nonnegative.`);
   }

@@ -1,5 +1,11 @@
 import { cleanNotes, estimateKey, estimateTempo, finalizeNotes, trackMelody } from './piano.js';
 
+// Browser, CLI and direct callers use the same stems controls.
+export const stemsDefaults = Object.freeze({
+  theta: 0.65, splitDb: 6, lhGroove: 0.6, rhLegato: 350, chordsOnly: false,
+  melodyHand: 'auto', melodyOctave: 0,
+});
+
 const endOf = n => n.end ?? n.startTimeSeconds + n.durationSeconds;
 const duration = n => endOf(n) - n.startTimeSeconds;
 const median = values => {
@@ -43,9 +49,13 @@ export function groupBy30(notes) {
 
 // A short phrase shares its nearest >=4 s neighbour's decision. If every phrase
 // is short, adjacent phrases decide together; a trailing singleton joins the
-// preceding pair. Nothing moves the vocal octave.
-export function assignMelodyHands(notes, tempo = {}) {
-  const line = internal(notes).map(n => ({ ...n, pitch: fold(n.pitch), role: 'melody' }));
+// preceding pair. An explicit octave shift precedes folding and hand assignment.
+export function assignMelodyHands(notes, tempo = {}, options = {}) {
+  const melodyHand = options.melodyHand ?? stemsDefaults.melodyHand;
+  const melodyOctave = options.melodyOctave ?? stemsDefaults.melodyOctave;
+  if (!['auto', 'left', 'right'].includes(melodyHand)) throw new Error('melodyHand must be auto, left or right.');
+  if (![-1, 0, 1].includes(melodyOctave)) throw new Error('melodyOctave must be -1, 0 or 1.');
+  const line = internal(notes).map(n => ({ ...n, pitch: fold(n.pitch + 12 * melodyOctave), role: 'melody' }));
   const rest = tempo.eligible ? 2 * 60 / tempo.estimatedBpm : 1;
   const phrases = [];
   for (const n of line) {
@@ -72,7 +82,8 @@ export function assignMelodyHands(notes, tempo = {}) {
   let previous;
   for (const indices of [...groups.values()].sort((a, b) => a[0] - b[0])) {
     const m = weightedMedianPitch(indices.flatMap(i => phrases[i].notes));
-    const hand = m >= 60 ? 'right' : m <= 57 ? 'left' : previous ?? (m >= 59 ? 'right' : 'left');
+    const hand = melodyHand !== 'auto' ? melodyHand :
+      m >= 60 ? 'right' : m <= 57 ? 'left' : previous ?? (m >= 59 ? 'right' : 'left');
     for (const i of indices) {
       const p = phrases[i];
       p.hand = hand;
@@ -301,7 +312,9 @@ function accompaniment(inst, line, phrases, harmony, options) {
       }
       const amplitude = Math.min(1, (time ? weighted / time : 0.5) / p95);
       let root;
-      if (hand === 'right' && part === 0) {
+      // Auto retains the optional shared-hand bass root; explicit hand controls
+      // reserve that entire hand for the melody.
+      if (hand === 'right' && part === 0 && options.melodyHand === 'auto') {
         const sounding = line.filter(n => n.startTimeSeconds <= segment.start + 1e-9 && n.end > segment.start);
         const choices = Array.from({ length: 13 }, (_, k) => k + 40).filter(p => pc(p) === chord.root &&
           sounding.every(n => n.pitch - p >= 5 && n.pitch - p <= 12));
@@ -317,7 +330,7 @@ function accompaniment(inst, line, phrases, harmony, options) {
         }
       }
       let pulse = 0;
-      const events = attacksFor(segment, inst, harmony, options.chordsOnly ? Infinity : options.lhGroove ?? 0.6).map(attack => ({
+      const events = attacksFor(segment, inst, harmony, options.chordsOnly ? Infinity : options.lhGroove).map(attack => ({
         ...attack,
         pitches: attack.block ? root && attack.t === segment.start ? pitches.slice(-2) : pitches :
           [pitches[hand === 'left' ? 1 + pulse++ % 2 : pulse++ % pitches.length]],
@@ -444,12 +457,13 @@ export function enforcePlayability(notes, bpm = 120) {
 }
 
 export function arrangeStems(melodyNotes, instrumentalNotes, options = {}) {
+  options = { ...stemsDefaults, ...Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined)) };
   const rawInst = internal(instrumentalNotes).map(n => ({ ...n, pitchMidi: n.pitch, durationSeconds: duration(n) }));
   const inst = cleanNotes(rawInst, options);
   // Tempo follows attacks. Melodia's onset-less sustain continuations must not
   // move the beat grid, but still contribute to the full harmonic chroma.
   const attacks = rawInst.some(n => n.onset === 0) ? cleanNotes(rawInst.filter(n => n.onset !== 0), options) : inst;
-  const vocal = internal(melodyNotes).map(n => ({ ...n, pitch: fold(n.pitch) }));
+  const vocal = internal(melodyNotes);
   let tempo = options.tempo ?? estimateTempo(attacks);
   if (!tempo.eligible && !options.tempo) tempo = estimateTempo([...attacks, ...vocal]);
   const last = Math.max(0, ...inst.map(n => n.end), ...vocal.map(n => n.end), options.durationSeconds ?? 0);
@@ -469,7 +483,7 @@ export function arrangeStems(melodyNotes, instrumentalNotes, options = {}) {
   for (const [start, end] of windows) {
     const candidates = inst.filter(n => n.pitch >= 55 && n.amplitude >= 0.5 * ampMedian &&
       n.startTimeSeconds >= start && n.startTimeSeconds < end && Math.min(n.end, end) - n.startTimeSeconds >= 0.2);
-    line.push(...trackMelody(groupBy30(candidates)).map(n => ({ ...n, pitch: fold(n.pitch), end: Math.min(n.end, end), source: 'instrumental' })));
+    line.push(...trackMelody(groupBy30(candidates)).map(n => ({ ...n, end: Math.min(n.end, end), source: 'instrumental' })));
   }
   line = line.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds).reduce((out, n) => {
     const previous = out.at(-1);
@@ -480,11 +494,11 @@ export function arrangeStems(melodyNotes, instrumentalNotes, options = {}) {
   }, []);
   for (let i = 0; i < line.length; i++) {
     const next = line[i + 1], cap = next ? next.startTimeSeconds - 0.015 : Infinity;
-    if (next && next.startTimeSeconds - line[i].end <= (options.rhLegato ?? 350) / 1000) line[i].end = cap;
+    if (next && next.startTimeSeconds - line[i].end <= options.rhLegato / 1000) line[i].end = cap;
     else line[i].end = Math.min(line[i].end, cap);
     line[i].velocity = 0.55 + 0.4 * Math.max(0, Math.min(1, line[i].amplitude));
   }
-  const assigned = assignMelodyHands(line, tempo);
+  const assigned = assignMelodyHands(line, tempo, options);
   const harmony = inferChords(inst, tempo, estimateKey(inst), { melody: assigned.notes });
   const backing = accompaniment(inst, assigned.notes, assigned.phrases, harmony, options);
   const before = filterClashes([...assigned.notes, ...backing]);
@@ -493,7 +507,8 @@ export function arrangeStems(melodyNotes, instrumentalNotes, options = {}) {
   const result = enforcePlayability(filterClashes(final), final.estimatedBpm);
   const melody = result.filter(n => n.role === 'melody'), melodyTime = melody.reduce((sum, n) => sum + duration(n), 0);
   for (const key of Object.keys(final)) if (!/^\d+$/.test(key)) result[key] = final[key];
-  result.vocalMedianPitch = weightedMedianPitch(vocal);
+  result.vocalMedianPitch = weightedMedianPitch(vocal.map(n => ({ ...n, pitch: fold(n.pitch) })));
+  result.melodyMedianPitch = weightedMedianPitch(melody);
   result.melodyLeftShare = melodyTime ? melody.filter(n => n.hand === 'left').reduce((sum, n) => sum + duration(n), 0) / melodyTime : 0;
   result.noVocals = noVocals;
   result.phrases = assigned.phrases.map(({ notes, ...phrase }) => phrase);

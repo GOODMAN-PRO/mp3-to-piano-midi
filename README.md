@@ -1,6 +1,6 @@
 # MP3 to Piano MIDI
 
-A static browser app and Node CLI for MP3/audio to piano MIDI. Audio stays on your device. The result is an approximate piano arrangement, not a score transcription. Exports use piano instruments, no pitch bends, and an estimated tempo when beat quantization is accepted (otherwise 120 BPM with original timing). The browser currently uses Spotify Basic Pitch on the full mix; the CLI defaults to vocal separation.
+A static browser app and Node CLI for MP3/audio to piano MIDI. Audio stays on your device. The result is an approximate piano arrangement, not a score transcription. Exports use piano instruments, no pitch bends, and an estimated tempo when beat quantization is accepted (otherwise 120 BPM with original timing). The browser and CLI default to a vocal melody with instrumental backing.
 
 ## Run
 
@@ -14,13 +14,26 @@ npx vite build
 
 Open the URL printed by Vite, choose audio, press **Convert**, then **Download MIDI**. Serve the page over HTTP rather than opening HTML directly. `dist/` is the static build; `.github/workflows/pages.yml` deploys it to GitHub Pages on pushes to `main`.
 
+Browser vocal separation requires **desktop Chrome or Edge with hardware WebGPU**, on HTTPS or localhost. The adapter must be non-null, not a software/fallback adapter, and support at least 151,000,000 bytes for both `maxStorageBufferBindingSize` and `maxBufferSize`. The Worker requests the adapter's buffer limits. The first two whole chunks predict separation time; a projection above three minutes, device loss, nonfinite output, or another separation error switches to Classic Cover on the already decoded mix and displays the reason. This limit covers separation, not total transcription time.
+
+Without usable WebGPU, the recommended arrangement is disabled and Cover (Classic) is selected. **On Quest: convert on your PC and download the MIDI to the headset.** Classic remains available on the headset; WebGPU separation on Quest is not promised.
+
+First use downloads a 67 MB model from **huggingface.co** (and its download hosts). **Your audio never leaves this browser.** The download is streamed, checked against the SHA-256 below, and stored in Cache Storage `sep-models-v1`; cached bytes are verified before reuse. If storage is full or unavailable, conversion continues with a notice and downloads again next time. The commit-pinned mirror is the browser's model source; if unavailable, Classic Cover is used.
+
+The page decodes 44.1 kHz audio on the main thread and transfers stereo samples to a module Worker. Separation, decimation and vocal melody tracking use the same modules as the CLI. The ONNX session is released and its Worker terminated before Basic Pitch starts on the instrumental. Note extraction runs in a second Worker to keep the page responsive. **Cancel** stops Workers, aborts model downloads and stops Basic Pitch at the next batch boundary, freeing tensors and restoring the form.
+
+`onnxruntime-web` is pinned to **1.30.0** and imported as `onnxruntime-web/webgpu` in the separator Worker. Vite resolves the runtime's own asset URLs: development serves the package assets, and production emits hashed WASM/JavaScript assets under `dist/assets`. There is no copy script, `public/ort`, `wasmPaths` override, or cross-origin isolation requirement. Both module Workers use ES output and the site retains `base: './'` for Pages/subdirectory hosting.
+
 ## Controls
 
-Automatic controls below are configurable through the CLI; the browser exposes the first seven rows.
+The browser exposes arrangement, melody hand/octave, backing, sensitivity, threshold, minimum length and beat snapping. Classic additionally exposes chord size and hand splitting. Other cleanup controls are CLI options.
 
 | Control | What it does | Default |
 | --- | --- | --- |
-| Arrangement / `--preset` | Cover follows a melody that can rest, with bass and sparse chord changes. Easy keeps melody plus the lowest bass and drops attacks shorter than 120 ms, except lone left-hand attacks during melody rests. Full keeps transcription chords. | `cover` |
+| Arrangement / `--classic --preset` | Vocal melody + backing separates the vocals. The mix-only group offers Full, Easy and Cover (Classic). Easy keeps melody plus the lowest bass; Full keeps transcription chords. | `stems` (Classic fallback: `cover`) |
+| Melody hand / `--melody-hand` | Auto uses the existing register rule. Left hand or Right hand forces the melody for the whole song and puts all backing in the opposite hand. | `auto` |
+| Melody octave / `--melody-octave` | Shifts the whole melody by −12, 0 or +12 semitones before hand assignment, folding only outside MIDI 36–96. | `0` |
+| Backing / `--chords-only` | Chords + pulses, or chords only. Applies to stems arrangements. | Chords + pulses |
 | Sensitivity / `--onset` | Onset threshold. Lower detects more attacks. | `0.5` |
 | Note threshold / `--frame` | Frame threshold. Lower retains quieter sustain. | `0.3` |
 | Min note length / `--min` | Minimum detection length, in milliseconds. | `80` |
@@ -41,7 +54,9 @@ Automatic controls below are configurable through the CLI; the browser exposes t
 | `--wobble` | Joins alternating semitone runs of singleton hand attacks within this many milliseconds; keeps the pitch with more note-time. Chords and nearby re-strikes are protected. | `0` (off) |
 | `--melody` | Positive enables the melody tracker with rests in Easy/Cover; zero restores highest-note selection. The numeric flag is retained for compatibility. | `3` (on) |
 
-Set a cleanup/length option to `0` to disable it. `--no-dynamics` restores raw amplitudes clamped to 0.05–1. The earlier tracker forced a choice in every group; its large-jump floor was a design limitation, not unavoidable transcription noise. Resting melody selection and sparser accompaniment make Cover the default: on five test songs its jump rate is below 13%, time with five sounding notes is below 0.05%, and mean sounding is lower than Full. This is still an estimate from a mix, not vocal isolation.
+Sensitivity, Note threshold and Min note length control Basic Pitch on the instrumental in stems mode, with the Melodia continuation pass disabled. Max notes per chord and Split hands are hidden there because stems assigns hands explicitly.
+
+Set a cleanup/length option to `0` to disable it. `--no-dynamics` restores raw amplitudes clamped to 0.05–1. The earlier tracker forced a choice in every group; its large-jump floor was a design limitation, not unavoidable transcription noise. Cover remains the Classic default: on five test songs its jump rate is below 13%, time with five sounding notes is below 0.05%, and mean sounding is lower than Full. This is still an estimate from a mix, not vocal isolation.
 
 Each hand is limited to five notes spanning 14 semitones per 30 ms attack group. The boundary may move away from the preferred split; impossible chords lose the quietest offending notes. The sounding cap preserves new attacks and notes younger than 60 ms, so temporary excess polyphony is possible. Sustained notes can still exceed a hand's reach.
 
@@ -59,19 +74,22 @@ node cli.mjs --help
 
 Without `--out`, the MIDI is written beside the input. CPU inference can take several minutes. Model outputs are cached in `.cache/` by basename and size, checked against source path/mtime and model timestamp; parameter changes reuse inference. Delete the matching cache to force inference. Classic decoding is limited to 256 MiB of mono 22050 Hz float audio (about 50 minutes); stems decoding allows 512 MiB of stereo 44100 Hz float audio (about 25 minutes).
 
-### Vocal melody and instrumental backing (CLI default)
+### Vocal melody and instrumental backing (browser and CLI default)
 
-The melody comes from the separated vocals, played by whichever hand matches its register; accompaniment comes from the instrumental. Vocal pitches stay at their real octave, folding only outside MIDI 36–96. Phrases use a duration-weighted median: 60 or higher goes right, 57 or lower goes left, and the middle range keeps the previous hand (first phrase: right at 59 or above). Phrases shorter than four seconds share a decision with a neighbouring phrase. Melody rests of at least one second, or two accepted beats, separate phrases.
+The melody comes from the separated vocals; accompaniment comes from the instrumental. By default vocal pitches stay at their real octave, folding only outside MIDI 36–96. Auto phrases use a duration-weighted median: 60 or higher goes right, 57 or lower goes left, and the middle range keeps the previous hand (first phrase: right at 59 or above). Phrases shorter than four seconds share a decision with a neighbouring phrase. Melody rests of at least one second, or two accepted beats, separate phrases. An explicit octave shift applies before this rule; forcing Left or Right overrides only the hand decision.
 
 The other hand plays sparse chord blocks and pulses below or above the melody. Close semitone clashes are revoiced or removed. Vocal gaps of at least two seconds can use an instrumental melody; songs with little detected singing use that fallback throughout. This is a generated arrangement and still needs a listening check.
+
+Extreme hand/octave choices can leave no room for backing within the existing register and span limits. In that case backing notes are omitted while the requested melody is preserved.
 
 ```sh
 npm i --cache G:\Temp\npm-cache -O onnxruntime-node@1.30.0
 node cli.mjs "song.mp3" --keep-stems ".cache/listen/song" --out "song-stems.mid" --json
 node cli.mjs "song.mp3" --classic --preset cover --out "song-cover.mid"
+node cli.mjs "Kiss of Death.mp3" --melody-hand left --melody-octave -1 --out "Kiss of Death-stems-left-oct-1.mid"
 ```
 
-The optional runtime is loaded only in stems mode. `--ep dml|cpu` chooses separation execution (DirectML on Windows by default, with CPU retry on failure; CPU elsewhere). `--keep-stems <dir>` writes float32 `vocals.wav` and `instrumental.wav`. `--classic` preserves the original Full/Easy/Cover pipeline and does not need ONNX Runtime. The browser controls are unchanged.
+The optional Node runtime is loaded only in stems mode. `--ep dml|cpu` chooses separation execution (DirectML on Windows by default, with CPU retry on failure; CPU elsewhere). `--keep-stems <dir>` writes float32 `vocals.wav` and `instrumental.wav`. `--classic` preserves the original Full/Easy/Cover pipeline and does not need ONNX Runtime.
 
 Stems tuning: `--theta 0.65` controls vocal detection, `--split-db 6` controls repeated-note energy dips (`99` disables almost all such splits), `--lh-groove 0.6` controls accompaniment pulses in either hand, `--chords-only` removes pulses, and `--rh-legato 350` sets melody gap filling in milliseconds in either hand. `--no-quantize` preserves timing. Classic preset, hand-split boundary and polyphony controls do not select the stems melody or its hand.
 
@@ -79,11 +97,11 @@ Separation decodes at 44.1 kHz stereo without loudness normalisation. Mono is du
 
 The model is copied from the local research download when available, otherwise downloaded from the [official UVR release](https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_2.onnx), then checked against SHA-256 `ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b`. It stays in ignored `.cache/models/`. Stem inference caches end in `-stems.json` and retain default melody notes plus instrumental frames; a small vocal audio cache supports melody parameter sweeps. Changes to shared audio-processing code invalidate these caches.
 
-Vocal separation: UVR MDX-Net Kim_Vocal_2, trained by Kimberley Jensen, distributed by Ultimate Vocal Remover (MIT code; the model weights are not covered by this repository's licence and are downloaded at runtime, not redistributed).
+Vocal separation: Kim_Vocal_2 (UVR MDX-Net) by Kimberley Jensen, via Ultimate Vocal Remover. UVR code is MIT; the model weights are not covered by this repository's licence and are downloaded at runtime, not redistributed.
 
 `npm test` uses synthetic fixtures and does not require ONNX Runtime or personal audio. `npm run test:golden` checks optional local Python stem parity, melody counts and the 21 frozen classic MIDI files; missing local fixtures skip cleanly. Pages CI uses `npm ci --omit=optional`, then restores only Vite's two already-locked Linux native bindings with integrity verification.
 
-See [the run 1 verification report](STEMS-RUN1.md) for measured results, listening-file locations and limitations.
+Local verification reports and listening files are in ignored `.cache/`, including `.cache/STEMS-RUN1.md` and `.cache/STEMS-RUN2.md`.
 
 `--json` writes statistics to stdout and progress to stderr. Statistics describe the final arrangement before MIDI tick rounding. Fragments count same-pitch gaps ≤50 ms, including real repeats; chord/hand metrics use anchored 30 ms groups. Sounding metrics cover first onset through last release. Key estimates use duration-weighted [Krumhansl–Schmuckler profiles](https://music21.org/music21docs/_modules/music21/analysis/discrete.html); out-of-key does not necessarily mean wrong. Wobble counts alternating singleton semitone triples ≤150 ms apart. Melody jump rate counts intervals >7 semitones; Classic follows the highest right-hand pitch per group. `estimatedBpm` is the exported tempo; `gridDeviationMs` measures pre-snap starts against the candidate grid (120 BPM grid after rejection). `tempoConfidence` and `phaseConfidence` report the two guards; `quantizedNotes` counts starts accepted for snapping, and `timingOffsetSeconds` records the common shift. Duration percentiles use ms; velocities use 0–1.
 
@@ -97,10 +115,10 @@ After cleanup and playable hand assignment, Easy/Cover track right-hand candidat
 - `piano.js`: shared cleanup, voice tracking, tempo estimation, quantization, and dynamics. Removed anchors trigger regrouping. Inputs are unchanged; array metadata carries hand, tempo, and timing diagnostics.
 - `midi.js`: hand-labelled notes → explicit ticks at the estimated tempo. Same-tick same-pitch attacks coalesce; cross-hand re-strikes leave a one-tick release gap. Adjacent-tick handoffs coalesce when a positive note and release gap cannot both fit.
 
-`pianoDefaults` and `defaultMaxSounding(preset)` in `piano.js` are the shared defaults; HTML values are checked by tests. `main.js` decodes browser audio and reuses one scoped model with WebGL-to-CPU fallback; `cli.mjs` handles ffmpeg, local inference caching, and statistics. Tests cover the shared pipeline, MIDI round trips, rich browser/CLI parity and a quantized browser download. TensorFlow is overridden to 4.22 because 3.21 had a WebGL concat-shader failure. No server is needed in production.
+`pianoDefaults` and `defaultMaxSounding(preset)` in `piano.js`, plus `stemsDefaults` in `stems.js`, are the shared defaults. Browser/CLI parity tests cover all stems options with a fake separation result; synthetic Worker tests cover progress, completion, error, cancellation, GPU gating and model caching. `main.js` decodes browser audio and scopes/disposes the Basic Pitch model per conversion, with WebGL-to-CPU fallback; `cli.mjs` handles ffmpeg, local inference caching, and statistics. Tests also cover MIDI round trips and a quantized browser download. TensorFlow is overridden to 4.22 because 3.21 had a WebGL concat-shader failure. No server is needed in production.
 
 ## Getting the MIDI onto a Meta Quest 3
 
 - **PianoVision:** install the [PianoVision desktop app](https://www.pianovision.com/resources/), run PianoVision on the headset, and link the desktop app to the headset on the same network. Upload the `.mid` and fill in the artist and title. It appears under **Imports** in the headset.
 - **Other VR piano apps:** connect the Quest by USB, allow file access on the headset, and copy the `.mid` into the app's folder or **Download**, according to the app's import instructions.
-- **Hosted page:** open this page in the Quest browser and download the `.mid` straight to the headset. Use the destination app's supported import method; PianoVision's documented workflow uses its desktop app.
+- **Hosted page:** Classic can convert directly on the Quest browser. For vocal separation, convert on a desktop PC, then transfer/download the resulting MIDI to the headset. Use the destination app's supported import method; PianoVision's documented workflow uses its desktop app.

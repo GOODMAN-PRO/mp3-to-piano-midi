@@ -10,6 +10,8 @@ import { estimateKey, estimateTempo, quantizeNotes, trackVoice, trackMelody, pia
   toPianoNotes as pianoWithLengthDefaults } from '../piano.js';
 import { notesToMidi } from '../midi.js';
 import { defaults, noteStats } from '../cli.mjs';
+import { arrangeStems, stemsDefaults } from '../stems.js';
+import { downmixToStereo, decimate2, mono } from '../separate.js';
 
 const note = (pitchMidi, startTimeSeconds = 0, durationSeconds = 1, amplitude = 0.5) =>
   ({ pitchMidi, startTimeSeconds, durationSeconds, amplitude });
@@ -974,7 +976,7 @@ assert.equal(validMidiNotes[0].ticks, 3600 * 960);
 
 assert.deepEqual(noteStats([]), {
   notes: 0, seconds: 0, notesPerSec: 0, medianDurationMs: 0, pctUnder100ms: 0,
-  pctUnder120ms: 0, melodyNotesPerSec: 0, melodyLeftShare: 0, vocalMedianPitch: null,
+  pctUnder120ms: 0, melodyNotesPerSec: 0, melodyLeftShare: 0, vocalMedianPitch: null, melodyMedianPitch: null,
   melodyMetricSource: 'highest-right-hand-estimate', accompanimentAttacksPerSec: 0, clashPct: 0,
   perHand: {
     left: { accompanimentAttacksPerSec: 0, maxAccompanimentAttacksIn1s: 0, meanSounding: 0, maxSounding: 0 },
@@ -1177,45 +1179,108 @@ try {
 // Browser smoke test: use real processing, with only the DOM/audio/model mocked.
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const browserSource = readFileSync(new URL('../main.js', import.meta.url), 'utf8')
-  .replace(/^import .*;\r?\n/gm, '').replace('import.meta.env.BASE_URL', '"/"');
-async function browserRun(preset, { empty = false, fail = false, quantize, fixture, splitHands } = {}) {
+  .replace(/^import .*;\r?\n/gm, '').replaceAll('import.meta.env.BASE_URL', '"/"')
+  .replaceAll('import.meta.url', '"http://local/main.js"');
+async function browserRun(preset, { empty = false, fail = false, quantize, fixture, splitHands,
+  melodyHand, melodyOctave, chordsOnly, gpu = true, separationError, cancelStage } = {}) {
   const elements = new Map();
   const element = selector => {
     if (!elements.has(selector)) {
       const tag = html.match(new RegExp(`<[^>]+id="${selector.slice(1)}"[^>]*>`))?.[0] ?? '';
-      elements.set(selector, { value: tag.match(/value="([^"]*)"/)?.[1] ?? '', checked: tag.includes('checked'),
-        disabled: false, listeners: {}, addEventListener(type, listener) { this.listeners[type] = listener; } });
+      const choices = [...(html.match(new RegExp(`<select id="${selector.slice(1)}">([\\s\\S]*?)</select>`))?.[1] ?? '')
+        .matchAll(/<option[^>]*>/g)].map(match => match[0]);
+      const selected = choices.find(choice => /\bselected\b/.test(choice)) ?? choices[0] ?? tag;
+      elements.set(selector, { value: selected.match(/value="([^"]*)"/)?.[1] ?? '', checked: tag.includes('checked'),
+        disabled: false, listeners: {}, style: {}, options: [],
+        addEventListener(type, listener) { this.listeners[type] = listener; },
+        setAttribute(name, value) { this[name] = value; }, removeAttribute(name) { delete this[name]; } });
     }
     return elements.get(selector);
   };
-  element('#preset').value = preset;
-  if (quantize !== undefined) element('#quantize').checked = quantize;
-  if (splitHands !== undefined) element('#split').checked = splitHands;
   element('#file').files = [{ name: 'song.mp3', arrayBuffer: async () => new ArrayBuffer(0) }];
-  let extractionOptions, pianoOptions, output, midiBytes, midiOptions, downloadBlob;
+  let extractionOptions, pianoOptions, output, midiBytes, midiOptions, downloadBlob, separationOptions;
+  const modelState = { loads: 0, disposed: 0, scopes: 0, decodes: 0 };
+  const workers = [];
+  const runExtraction = (f, o, options) => {
+    extractionOptions = options;
+    if (fail) throw new Error('extract failed');
+    return fixture?.notes ?? extractNotes(f, o, options);
+  };
+  const audioLength = 32;
+  const fakeSeparation = { melody: fixture?.melody ?? [], inst22k: new Float32Array(audioLength / 2), timings: {} };
+  class FakeWorker {
+    constructor(url) { this.url = String(url); this.listeners = {}; workers.push(this); }
+    addEventListener(type, handler) { this.listeners[type] = handler; }
+    removeEventListener(type) { delete this.listeners[type]; }
+    terminate() { this.terminated = true; }
+    postMessage(message) {
+      if (message.type === 'cancel') return;
+      queueMicrotask(() => {
+        if (this.terminated) return;
+        const emit = data => (this.onmessage ?? this.listeners.message)?.({ data });
+        try {
+          if (this.url.includes('extract.worker')) {
+            if (cancelStage === 'extract') { element('#cancel').listeners.click(); return; }
+            emit({ type: 'done', notes: runExtraction(message.frames, message.onsets, message.options) });
+          } else {
+            separationOptions = message.melodyOptions;
+            if (cancelStage === 'separating') { element('#cancel').listeners.click(); return; }
+            if (separationError) emit({ type: 'error', id: message.id, reason: separationError });
+            else {
+              emit({ type: 'progress', id: message.id, stage: 'separating', frac: 1, completed: 2, total: 2 });
+              emit({ type: 'done', id: message.id, ...fakeSeparation });
+            }
+          }
+        } catch (error) { emit({ type: 'error', reason: error.message }); }
+      });
+    }
+  }
+  class FakeURL extends URL {
+    static createObjectURL(blob) { downloadBlob = blob; return 'blob:test'; }
+    static revokeObjectURL() {}
+  }
   runInNewContext(browserSource, {
-    pianoDefaults, defaultMaxSounding,
-    document: { querySelector: element, getElementById: id => element(`#${id}`) },
-    AudioContext: class { async decodeAudioData() { return { length: 1, numberOfChannels: 1,
-      sampleRate: 22050, getChannelData: () => new Float32Array(1) }; } async close() {} },
-    BasicPitch: class { model = Promise.resolve(); async evaluateModel(_, complete, progress) {
+    pianoDefaults, defaultMaxSounding, stemsDefaults, downmixToStereo, decimate2, mono,
+    probeWebGPU: async () => ({ supported: gpu, reason: gpu ? '' : 'WebGPU is unavailable' }),
+    document: { querySelector: element, getElementById: id => element(`#${id}`), querySelectorAll: () => [] },
+    AudioContext: class { constructor(options) { this.sampleRate = options.sampleRate; }
+      async decodeAudioData() { modelState.decodes++; return { length: audioLength, duration: audioLength / this.sampleRate, numberOfChannels: 1,
+        sampleRate: this.sampleRate, getChannelData: () => new Float32Array(audioLength) }; } async close() {} },
+    BasicPitch: class { constructor(model = Promise.resolve()) { this.model = Promise.resolve(model); }
+      async evaluateModel(_, complete, progress) {
+      if (cancelStage === 'basicPitch') element('#cancel').listeners.click();
       complete(empty ? [] : fixture?.frames ?? frames, empty ? [] : fixture?.onsets ?? strongOnsets); progress(1);
     } },
-    tf: { engine: () => ({ startScope() {}, endScope() {} }), getBackend: () => 'cpu' },
-    extractNotes: (f, o, options) => { extractionOptions = options; if (fail) throw new Error('extract failed');
-      return fixture?.notes ?? extractNotes(f, o, options); },
+    tf: { engine: () => ({ startScope() { modelState.scopes++; }, endScope() { modelState.scopes--; } }), getBackend: () => 'cpu',
+      loadGraphModel: async () => {
+        assert.ok(workers.filter(worker => worker.url.includes('separate.worker')).every(worker => worker.terminated),
+          'Terminate the separator Worker before loading Basic Pitch');
+        modelState.loads++;
+        return { dispose() { modelState.disposed++; } };
+      }, ready: async () => {}, setBackend: async () => {} },
+    extractNotes: runExtraction,
+    arrangeStems: (melody, notes, options) => { pianoOptions = options; return arrangeStems(melody, notes, options); },
     toPianoNotes: (notes, options) => { pianoOptions = options; return pianoWithLengthDefaults(notes, options); },
     notesToMidi: (notes, options) => {
       output = notes; midiOptions = options; midiBytes = notesToMidi(notes, options); return midiBytes;
     },
-    Blob, URL: { createObjectURL: blob => { downloadBlob = blob; return 'blob:test'; }, revokeObjectURL() {} },
+    Blob, URL: FakeURL, Worker: FakeWorker, AbortController, DOMException, Float32Array,
+    performance, setTimeout, clearTimeout, navigator: gpu ? { gpu: {} } : {},
     console: { error() {}, warn() {} },
   });
+  await new Promise(resolve => setImmediate(resolve));
+  if (preset !== undefined) element('#preset').value = preset;
+  if (quantize !== undefined) element('#quantize').checked = quantize;
+  if (splitHands !== undefined) element('#split').checked = splitHands;
+  if (melodyHand !== undefined) element('#melody-hand').value = melodyHand;
+  if (melodyOctave !== undefined) element('#melody-octave').value = String(melodyOctave);
+  if (chordsOnly !== undefined) element('#backing').value = chordsOnly ? 'chords' : 'pulses';
   await element('#form').listeners.submit({ preventDefault() {} });
   assert.equal(element('#controls').disabled, false);
   assert.equal(element('#convert').disabled, false);
   if (downloadBlob) midiBytes = new Uint8Array(await downloadBlob.arrayBuffer());
-  return { element, extractionOptions, pianoOptions, output, midiBytes, midiOptions };
+  return { element, extractionOptions, pianoOptions, output, midiBytes, midiOptions, separationOptions,
+    fakeSeparation, workers, modelState };
 }
 const cliExtraction = {
   onsetThresh: defaults.onset, frameThresh: defaults.frame, minMs: defaults.min, energyTolerance: defaults.tolerance,
@@ -1223,10 +1288,10 @@ const cliExtraction = {
 const cliPiano = { ...defaults, maxPoly: defaults.poly };
 const presetMarkup = html.match(/<select id="preset">([\s\S]*?)<\/select>/)[1];
 assert.deepEqual([...presetMarkup.matchAll(/<option[^>]*value="([^"]+)"/g)].map(match => match[1]),
-  ['full', 'easy', 'cover']);
+  ['stems', 'full', 'easy', 'cover']);
 const presetTags = [...presetMarkup.matchAll(/<option[^>]*>/g)].map(match => match[0]);
 const selectedPresetTag = presetTags.find(tag => /\bselected\b/.test(tag)) ?? presetTags[0];
-assert.equal(selectedPresetTag.match(/value="([^"]+)"/)[1], defaults.preset);
+assert.equal(selectedPresetTag.match(/value="([^"]+)"/)[1], 'stems');
 for (const preset of ['full', 'easy', 'cover']) {
   const browser = await browserRun(preset);
   assert.deepEqual({ ...browser.extractionOptions }, { ...pianoDefaults, ...cliExtraction });
@@ -1323,6 +1388,74 @@ for (const preset of ['full', 'easy', 'cover']) {
   });
   assert.deepEqual(browser.output, cli, `Browser / CLI defaults differ for ${preset}`);
   assert.deepEqual(browser.midiBytes, notesToMidi(cli), `Browser / CLI MIDI differs for ${preset}`);
+}
+// The real browser submit path receives a fake separator result; extraction,
+// arrangement and MIDI remain shared production code, without any WebGPU in CI.
+const fakeVocal = Array.from({ length: 100 }, (_, i) =>
+  note([64, 67, 69, 67][Math.floor(i / 10) % 4], i * 0.34, 0.30, 0.8));
+const stemsFixture = { notes: richSong, melody: fakeVocal };
+for (const controls of [
+  {}, { melodyHand: 'left', melodyOctave: -1 }, { melodyHand: 'right', melodyOctave: 1, chordsOnly: true },
+  { melodyHand: 'left', melodyOctave: 0, quantize: false }, { melodyHand: 'auto', melodyOctave: -1 },
+]) {
+  const browser = await browserRun('stems', { fixture: stemsFixture, splitHands: false, ...controls });
+  const expectedOptions = { ...stemsDefaults, ...controls };
+  for (const [key, value] of Object.entries(stemsDefaults)) {
+    assert.equal(browser.pianoOptions[key], expectedOptions[key] ?? value, `Browser arrangement stems option: ${key}`);
+    assert.equal(browser.separationOptions[key], expectedOptions[key] ?? value, `Browser Worker stems option: ${key}`);
+  }
+  assert.equal(Object.hasOwn(browser.separationOptions, 'minMs'), false,
+    'Basic Pitch minimum note length must not override the vocal tracker minimum');
+  assert.deepEqual({ ...browser.extractionOptions }, { ...pianoDefaults, ...cliExtraction, melodiaTrick: false });
+  const cli = arrangeStems(fakeVocal, richSong, {
+    ...cliPiano, ...expectedOptions, durationSeconds: browser.pianoOptions.durationSeconds,
+  });
+  assert.deepEqual(browser.output, cli, 'Browser / CLI stems defaults or controls differ');
+  assert.deepEqual(browser.midiBytes, notesToMidi(cli), 'Browser / CLI stems MIDI differs');
+  assert.equal(browser.midiOptions.splitHands, true, 'Stems always exports the explicit hands');
+  assert.ok(browser.workers.every(worker => worker.terminated));
+  assert.equal(browser.modelState.loads, 1);
+  assert.equal(browser.modelState.disposed, 1);
+  assert.equal(browser.modelState.scopes, 0);
+  assert.match(browser.element('#summary').textContent,
+    /^\d+ notes · melody from vocals \(L \d+% \/ R \d+%\) · backing from instrumental · done in \d+ s$/);
+}
+const extractedStems = await browserRun('stems', { fixture: { ...browserClicks, melody: fakeVocal } });
+const cliStemsExtraction = extractNotes(clickFrames, clickOnsets, { ...cliExtraction, melodiaTrick: false });
+assert.deepEqual(extractedStems.output, arrangeStems(fakeVocal, cliStemsExtraction, {
+  ...cliPiano, ...stemsDefaults, durationSeconds: extractedStems.pianoOptions.durationSeconds,
+}), 'The browser must use the same instrumental extraction settings as the CLI');
+const defaultStems = await browserRun(undefined, { fixture: stemsFixture });
+assert.equal(defaultStems.element('#preset').value, 'stems');
+assert.equal(defaultStems.element('#max-poly').disabled, true);
+assert.equal(defaultStems.element('#split').disabled, true);
+const noGPU = await browserRun(undefined, { gpu: false });
+assert.equal(noGPU.element('#preset').value, 'cover');
+assert.equal(noGPU.element('#stems-option').disabled, true);
+assert.match(noGPU.element('#stems-option').textContent, /needs WebGPU \(desktop Chrome\/Edge\)/);
+assert.match(noGPU.element('#gpu-notice').textContent, /On Quest: convert on your PC and download the MIDI to the headset\./);
+assert.ok(noGPU.workers.every(worker => worker.url.includes('extract.worker')));
+assert.equal(noGPU.pianoOptions.preset, 'cover');
+assert.equal(noGPU.extractionOptions.melodiaTrick, undefined);
+const fallback = await browserRun('stems', { separationError: 'GPU was lost' });
+assert.equal(fallback.modelState.decodes, 1, 'Separation failure must reuse the decoded mix');
+assert.equal(fallback.pianoOptions.preset, 'cover');
+assert.match(fallback.element('#conversion-notice').textContent,
+  /Vocal separation failed \(GPU was lost\); using Classic Cover instead\./);
+assert.ok(fallback.workers.every(worker => worker.terminated));
+const noVocals = await browserRun('stems', { fixture: { notes: richSong, melody: [] } });
+assert.equal(noVocals.output.noVocals, true);
+assert.match(noVocals.element('#conversion-notice').textContent,
+  /No singing detected: using the instrumental's top line for the melody\./);
+for (const cancelStage of ['separating', 'basicPitch', 'extract']) {
+  const cancelled = await browserRun('stems', { fixture: stemsFixture, cancelStage });
+  assert.equal(cancelled.output, undefined);
+  assert.equal(cancelled.element('#download').hidden, true);
+  assert.equal(cancelled.element('#cancel').hidden, true);
+  assert.match(cancelled.element('#status').textContent, /^Cancelled\./);
+  assert.ok(cancelled.workers.every(worker => worker.terminated));
+  assert.equal(cancelled.modelState.disposed, cancelled.modelState.loads);
+  assert.equal(cancelled.modelState.scopes, 0);
 }
 const failedBrowser = await browserRun('full', { fail: true });
 assert.match(failedBrowser.element('#status').textContent, /Could not create the MIDI file/);

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { arrangeStems, assignMelodyHands, enforcePlayability, filterClashes, groupBy30, inferChords, weightedMedianPitch } from '../stems.js';
-import { noteStats } from '../cli.mjs';
+import { arrangeStems, assignMelodyHands, enforcePlayability, filterClashes, groupBy30, inferChords,
+  weightedMedianPitch, stemsDefaults } from '../stems.js';
+import { noteStats, stemsDefaults as cliStemsDefaults } from '../cli.mjs';
 import { notesToMidi } from '../midi.js';
 import midiPackage from '@tonejs/midi';
 
@@ -13,6 +14,8 @@ const noGrid = { eligible: false, estimatedBpm: 120, gridPhaseSeconds: 0,
   tempoConfidence: 0, phaseConfidence: 0, gridDeviationMs: 0 };
 const grid = { ...noGrid, eligible: true, tempoConfidence: 1, phaseConfidence: 1 };
 
+assert.equal(cliStemsDefaults, stemsDefaults, 'The CLI must use the shared frozen stems defaults object');
+assert.equal(Object.isFrozen(stemsDefaults), true);
 assert.equal(weightedMedianPitch([note(48, 0, 3), note(72, 4, 1), note(72, 6, 1)]), 48);
 assert.equal(weightedMedianPitch([]), null);
 let assignment = assignMelodyHands([...phrase(52, 0), ...phrase(72, 7)], noGrid);
@@ -32,6 +35,13 @@ assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'left', 'right', 
 assert.equal(assignMelodyHands([note(30, 0, 1), note(100, 2, 1)]).notes[0].pitch, 42);
 assert.equal(assignMelodyHands([note(30, 0, 1), note(100, 2, 1)]).notes[1].pitch, 88);
 assert.ok(assignMelodyHands([note(1e100, 0, 1)]).notes.every(n => n.pitch >= 36 && n.pitch <= 96));
+assert.equal(assignMelodyHands([note(30, 0, 1)], noGrid, { melodyOctave: 1 }).notes[0].pitch, 42,
+  'Shift the original pitch before folding notes outside the piano range');
+assert.equal(assignMelodyHands([note(100, 0, 1)], noGrid, { melodyOctave: -1 }).notes[0].pitch, 88);
+assert.equal(assignMelodyHands(phrase(67, 0), noGrid, { melodyOctave: -1 }).phrases[0].hand, 'left',
+  'Auto assigns the hand from the shifted register');
+assert.throws(() => assignMelodyHands([], noGrid, { melodyHand: 'both' }), /melodyHand/);
+assert.throws(() => assignMelodyHands([], noGrid, { melodyOctave: 2 }), /melodyOctave/);
 const rests = [note(52, 0, 1), note(72, 2.2, 1)];
 assert.equal(assignMelodyHands(rests, noGrid).phrases.length, 2);
 assert.equal(assignMelodyHands(rests, { ...grid, estimatedBpm: 60 }).phrases.length, 1, 'Accepted tempo uses two beats');
@@ -145,9 +155,34 @@ for (const pitch of [52, 72]) for (const quantize of [false, true]) {
     }
   }
 }
+for (const melodyHand of ['left', 'right']) for (const melodyOctave of [-1, 0, 1]) {
+  const pitch = melodyHand === 'left' ? 60 : 64;
+  const output = arrangeStems(voice(pitch), backing, { ...options, melodyHand, melodyOctave });
+  const melody = output.filter(n => n.role === 'melody'), accompaniment = output.filter(n => n.role !== 'melody');
+  const shifted = pitch + 12 * melodyOctave;
+  assert.ok(melody.length >= 15 && accompaniment.length > 0);
+  assert.ok(melody.every(n => n.pitch === shifted && n.hand === melodyHand));
+  assert.ok(accompaniment.every(n => n.hand !== melodyHand), 'Forced hand reserves the whole hand for the melody');
+  for (const n of accompaniment) for (const m of melody) {
+    if (n.startTimeSeconds >= m.end - 1e-9 || m.startTimeSeconds >= n.end - 1e-9) continue;
+    assert.ok(melodyHand === 'left' ? n.pitch >= Math.max(60, shifted + 3) : n.pitch <= shifted - 2);
+  }
+  const stats = noteStats(output);
+  assert.equal(stats.clashPct, 0);
+  assert.equal(stats.handSpanViolations, 0);
+  assert.equal(stats.handPolyViolations, 0);
+  assert.equal(stats.melodyLeftShare, melodyHand === 'left' ? 1 : 0);
+  assert.equal(stats.melodyMedianPitch, shifted);
+}
 const instrumentalOnly = arrangeStems([], harmonyNotes.map(n => ({ ...n, pitch: n.pitch + 12 })), options);
 assert.equal(instrumentalOnly.noVocals, true);
 assert.ok(instrumentalOnly.some(n => n.role === 'melody'));
+const shiftedFallback = arrangeStems([], harmonyNotes.map(n => ({ ...n, pitch: n.pitch + 12 })),
+  { ...options, melodyHand: 'left', melodyOctave: -1 });
+assert.deepEqual(shiftedFallback.filter(n => n.role === 'melody').map(n => n.pitch),
+  instrumentalOnly.filter(n => n.role === 'melody').map(n => n.pitch - 12),
+  'The octave control applies equally to the instrumental fallback melody');
+assert.ok(shiftedFallback.filter(n => n.role === 'melody').every(n => n.hand === 'left'));
 const withGap = arrangeStems([...voice(72), ...voice(72, 10)],
   Array.from({ length: 32 }, (_, i) => [48, 55, 64].map(p => note(p, i * 0.5, 0.45))).flat(), options);
 assert.ok(withGap.some(n => n.role === 'melody' && n.startTimeSeconds > 6.2 && n.startTimeSeconds < 9.9),

@@ -87,6 +87,27 @@ try {
   assert.ok(first.midi.length > 0);
 
   const initialCache = readFileSync(cachePath);
+  const movedMelody = await convertFile(input, { ...options, melodyHand: 'right', melodyOctave: 1 });
+  assert.ok(movedMelody.piano.filter(note => note.role === 'melody')
+    .every(note => note.hand === 'right' && note.pitch === 64));
+  assert.ok(movedMelody.piano.filter(note => note.role !== 'melody').every(note => note.hand === 'left'));
+  assert.equal(movedMelody.stats.melodyLeftShare, 0);
+  assert.equal(movedMelody.stats.melodyMedianPitch, 64);
+  assert.equal(movedMelody.stats.timings.separation, 0);
+  assert.equal(movedMelody.stats.timings.basicPitch, 0);
+  assert.deepEqual(readFileSync(cachePath), initialCache, 'Hand and octave controls must reuse inference');
+
+  const forcedPath = join(temporary, 'forced.mid');
+  const forcedCli = spawnSync(process.execPath, [join(root, 'cli.mjs'), input, '--melody-hand', 'right',
+    '--melody-octave', '1', '--out', forcedPath, '--json'], { encoding: 'utf8', windowsHide: true });
+  assert.ifError(forcedCli.error);
+  assert.equal(forcedCli.status, 0, forcedCli.stderr);
+  const forcedStats = JSON.parse(forcedCli.stdout);
+  assert.equal(forcedStats.parameters.melodyHand, 'right');
+  assert.equal(forcedStats.parameters.melodyOctave, 1);
+  assert.equal(forcedStats.melodyLeftShare, 0);
+  assert.equal(forcedStats.melodyMedianPitch, 64);
+
   const adjusted = await convertFile(input, { ...options, onset: 0.999, frame: 0.99, lhGroove: 0.9 });
   assert.equal(adjusted.stats.cacheHit, true);
   assert.equal(adjusted.stats.timings.basicPitch, 0);
@@ -138,6 +159,10 @@ try {
     [[input, '--ep', 'invalid'], 1, /--ep must be dml or cpu/],
     [[input, '--theta', 'NaN'], 1, /needs a finite number/],
     [[input, '--keep-stems'], 1, /--keep-stems needs a value/],
+    [[input, '--melody-hand', 'both'], 1, /--melody-hand must be auto, left or right/],
+    [[input, '--melody-hand'], 1, /--melody-hand must be auto, left or right/],
+    [[input, '--melody-octave', '2'], 1, /--melody-octave must be -1, 0 or 1/],
+    [[input, '--melody-octave', '0.5'], 1, /--melody-octave must be -1, 0 or 1/],
   ]) {
     const child = spawnSync(process.execPath, [join(root, 'cli.mjs'), ...args], {
       encoding: 'utf8', windowsHide: true,
