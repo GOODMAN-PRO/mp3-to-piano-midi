@@ -9,6 +9,7 @@ import { extractNotes } from './extract.js';
 import { estimateKey, pianoDefaults, defaultMaxSounding, toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 import { arrangeStems, stemsDefaults } from './stems.js';
+import { backingCoverage } from './backing-metrics.js';
 export { stemsDefaults } from './stems.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -17,6 +18,18 @@ export const defaults = {
   ...arrangementDefaults, onset: onsetThresh, frame: frameThresh, min: minMs,
   tolerance: energyTolerance, poly: maxPoly, maxSounding: defaultMaxSounding(pianoDefaults.preset),
 };
+const classicOnly = new Set(['preset', 'poly', 'maxSounding', 'splitAt', 'melody',
+  'minSounding', 'legatoGap', 'wobble', 'dynamics']);
+const stemsOnly = new Set(['keepStems', 'ep', 'theta', 'splitDb', 'lhGroove', 'rhLegato',
+  'chordsOnly', 'melodyHand', 'melodyOctave']);
+const flagName = key => `--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}`;
+const effectiveParameters = options => Object.fromEntries(Object.entries(options)
+  .filter(([key]) => !(options.classic ? stemsOnly : classicOnly).has(key)));
+export const STEREO_DECODE_VERSION = 2;
+export function legacyStereoDecodeSafe({ channels, sample_fmt } = {}) {
+  return Number.isInteger(channels) && channels > 0 &&
+    (channels <= 2 || /^(flt|dbl)p?$/.test(sample_fmt));
+}
 
 export function noteStats(notes) {
   const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
@@ -231,10 +244,14 @@ export function noteStats(notes) {
     melodyLeftShare: melodyTime ? melodyLeftTime / melodyTime : 0,
     melodyMetricSource: labelled ? 'role' : 'highest-right-hand-estimate',
     vocalMedianPitch: notes.vocalMedianPitch ?? null,
+    vocalDecisionMedianPitch: notes.vocalDecisionMedianPitch ?? null,
+    vocalMelodyLeftShare: notes.vocalMelodyLeftShare ?? null,
+    fallbackMelodyLeftShare: notes.fallbackMelodyLeftShare ?? null,
     melodyMedianPitch: notes.melodyMedianPitch ?? null,
     accompanimentAttacksPerSec: perHand.left.accompanimentAttacksPerSec + perHand.right.accompanimentAttacksPerSec,
     perHand,
     clashPct: melodyTime ? 100 * clashTime / melodyTime : 0,
+    ...backingCoverage(notes),
     estimatedBpm: notes.estimatedBpm ?? 120,
     gridDeviationMs: notes.gridDeviationMs ?? 0,
     tempoConfidence: notes.tempoConfidence ?? 0,
@@ -370,13 +387,13 @@ function decodeStereo(input) {
   const channels = Number(probe.stdout.toString().trim());
   if (!Number.isInteger(channels) || channels < 1) throw new Error('No usable audio stream.');
   const args = ['-v', 'error', '-i', input, '-map', '0:a:0'];
-  if (channels === 1) args.push('-af', 'pan=stereo|c0=c0|c1=c0');
+  if (channels === 1) args.push('-af', 'aformat=sample_fmts=fltp,pan=stereo|c0=c0|c1=c0');
   else if (channels > 2) {
     const side = parity => {
       const indexes = Array.from({ length: channels }, (_, i) => i).filter(i => i % 2 === parity);
       return indexes.map(i => `${1 / indexes.length}*c${i}`).join('+');
     };
-    args.push('-af', `pan=stereo|c0=${side(0)}|c1=${side(1)}`);
+    args.push('-af', `aformat=sample_fmts=fltp,pan=stereo|c0=${side(0)}|c1=${side(1)}`);
   }
   args.push('-ac', '2', '-ar', '44100', '-f', 'f32le', '-');
   const decoded = spawnSync('ffmpeg', args, { maxBuffer: 512 * 1024 * 1024, windowsHide: true });
@@ -412,6 +429,24 @@ async function stemsOutput(input, options) {
       cached.pipelineHash !== pipelineHash || cached.modelHash !== separationModel.sha256) cached = undefined;
   } catch (error) {
     if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+  }
+  if (cached && cached.stereoDecodeVersion !== STEREO_DECODE_VERSION) {
+    // Only surround integer PCM used the faulty integer-domain pan path.
+    // Upgrade safe legacy caches without rerunning expensive inference.
+    const probe = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'a:0',
+      '-show_entries', 'stream=channels,sample_fmt', '-of', 'json', input], { windowsHide: true });
+    if (probe.error || probe.status !== 0) {
+      throw new Error(`ffprobe failed while checking the legacy stereo cache: ${probe.error?.message ?? probe.stderr.toString().trim()}`);
+    }
+    const format = JSON.parse(probe.stdout.toString()).streams?.[0];
+    if (!legacyStereoDecodeSafe(format)) {
+      console.error('Regenerating legacy surround PCM cache with float-domain downmixing…');
+      cached = undefined;
+    } else {
+      cached.stereoDecodeVersion = STEREO_DECODE_VERSION;
+      const temporary = `${cachePath}.${process.pid}.tmp`;
+      writeFileSync(temporary, JSON.stringify(cached)); renameSync(temporary, cachePath);
+    }
   }
   const timings = { decode: 0, separation: 0, melody: 0, basicPitch: 0 };
   let vocal22, instrumental22, stemPaths = cached?.stemPaths, stemHashes = cached?.stemHashes, provider = cached?.provider;
@@ -504,6 +539,7 @@ async function stemsOutput(input, options) {
     // Keep the frozen-default melody in the inference cache, even after a tuned first run.
     const defaultMelody = tuned ? melodyNotes(vocal22, stemsDefaults) : melody;
     const record = { input, mtimeMs: source.mtimeMs, modelStamp, pipelineHash, modelHash: separationModel.sha256,
+      stereoDecodeVersion: STEREO_DECODE_VERSION,
       melody: defaultMelody, frames, onsets, duration: instrumental22.length / 22050, provider, stemPaths, stemHashes, timings };
     const temporary = `${cachePath}.${process.pid}.tmp`;
     writeFileSync(temporary, JSON.stringify(record)); renameSync(temporary, cachePath);
@@ -533,33 +569,58 @@ export async function convertFile(input, options = {}) {
     energyTolerance: options.tolerance, melodiaTrick: Boolean(options.classic),
   });
   const extraction = secondsSince(extractionStart), arrangementStart = performance.now();
-  const piano = options.classic ? toPianoNotes(notes, { ...options, maxPoly: options.poly })
+  let piano = options.classic ? toPianoNotes(notes, { ...options, maxPoly: options.poly })
     : arrangeStems(data.melody, notes, { ...options, durationSeconds: data.duration });
-  const timings = { ...data.timings, extraction, arrangement: secondsSince(arrangementStart), total: secondsSince(start) };
+  const timings = { ...data.timings, extraction, arrangement: secondsSince(arrangementStart) };
+  let fallbackCacheHit;
+  if (!options.classic && piano.needsFallback) {
+    console.error('Sparse or missing vocal melody; transcribing the original mix for fallback melody…');
+    const fallbackStart = performance.now();
+    const mix = await modelOutput(input);
+    timings.fallbackBasicPitch = secondsSince(fallbackStart);
+    fallbackCacheHit = mix.cacheHit;
+    const fallbackExtractionStart = performance.now();
+    const fallbackNotes = extractNotes(mix.frames, mix.onsets, {
+      onsetThresh: options.onset, frameThresh: options.frame, minMs: options.min,
+      energyTolerance: options.tolerance, melodiaTrick: true,
+    });
+    timings.fallbackExtraction = secondsSince(fallbackExtractionStart);
+    const fallbackArrangementStart = performance.now();
+    piano = arrangeStems(data.melody, notes, { ...options, fallbackNotes, durationSeconds: data.duration });
+    timings.arrangement += secondsSince(fallbackArrangementStart);
+  }
+  timings.total = secondsSince(start);
   return { piano, midi: notesToMidi(piano, { splitHands: options.splitHands !== false }),
     stats: { input, mode: options.classic ? 'classic' : 'stems', cacheHit: data.cacheHit,
       provider: data.provider, timings, inferenceTimings: data.inferenceTimings,
-      parameters: options, ...noteStats(piano) } };
+      fallbackUsed: Boolean(piano.fallbackUsed), fallbackCacheHit,
+      parameters: effectiveParameters(options), ...noteStats(piano) } };
 }
 
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes('--help')) {
-    const flags = Object.entries(defaults).filter(([, value]) => typeof value !== 'boolean').map(([key, value]) => `[--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} ${value}]`).join(' ');
-    console.log(`Usage: node cli.mjs <audio file> [--classic] [--ep dml|cpu] [--keep-stems dir] [--out file.mid] ${flags} [--no-dynamics] [--no-split] [--no-quantize] [--json]`);
+    const flags = classic => Object.entries(defaults).filter(([key, value]) =>
+      typeof value !== 'boolean' && classicOnly.has(key) === classic)
+      .map(([key, value]) => `${flagName(key)} ${value}`).join(' ');
+    console.log('Usage: node cli.mjs <audio file> [--classic] [--out file.mid] [--json] [mode options]');
     console.log('Default: separate vocals for the melody in its natural register; arrange instrumental backing in the other hand. --classic keeps the full-mix pipeline.');
-    console.log(`Stems controls: --theta ${stemsDefaults.theta} --split-db ${stemsDefaults.splitDb} --lh-groove ${stemsDefaults.lhGroove} --rh-legato ${stemsDefaults.rhLegato} (ms). --chords-only disables pulses.`);
-    console.log('Melody controls: --melody-hand auto|left|right --melody-octave -1|0|1. Auto keeps the register rule.');
+    console.log(`Both modes: ${flags(false)} --no-split --no-quantize.`);
+    console.log(`Classic only (--classic): ${flags(true)} --no-dynamics.`);
+    console.log(`Stems only (default): --ep dml|cpu --keep-stems dir --theta ${stemsDefaults.theta} --split-db ${stemsDefaults.splitDb} --lh-groove ${stemsDefaults.lhGroove} --rh-legato ${stemsDefaults.rhLegato} (ms) --chords-only --melody-hand auto|left|right --melody-octave -1|0|1.`);
+    console.log('Flags for the other mode are ignored with one warning per explicit flag. JSON parameters omit those ignored settings.');
     console.log(`--preset accepts full, easy or cover; their --max-sounding defaults are ${['full', 'easy', 'cover'].map(defaultMaxSounding).join(', ')}. Set --min-sounding 0 or --legato-gap 0 to disable length smoothing.`);
     console.log('--max-sounding, --key-clean and --wobble accept 0 to disable their cleanup steps; --melody 0 restores highest-note selection in Easy/Cover. Quantization skips short clips and weak tempo estimates.');
     return;
   }
   const input = resolve(args.shift());
   const options = { ...defaults, ...stemsDefaults };
+  const explicit = new Set();
   let output = join(dirname(input), `${basename(input, extname(input))}.mid`);
   let splitHands = true, json = false, maxSoundingSet = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+    explicit.add(arg);
     const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
     if (arg === '--no-split') splitHands = false;
     else if (arg === '--classic') options.classic = true;
@@ -604,6 +665,13 @@ async function main() {
     if (options[key] < 0) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be nonnegative.`);
   }
   if (output.toLowerCase() === input.toLowerCase()) throw new Error('Output must differ from the input audio file.');
+  const ignored = options.classic ? stemsOnly : classicOnly;
+  for (const flag of explicit) {
+    const key = flag === '--no-dynamics' ? 'dynamics'
+      : flag.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+    if (ignored.has(key)) console.error(`Warning: ${flag} ignored in ${options.classic ? 'Classic' : 'stems'} mode` +
+      ` (${options.classic ? 'remove --classic to use it' : 'use --classic to apply it'}).`);
+  }
   const { piano, midi, stats: result } = await convertFile(input, { ...options, splitHands });
   writeFileSync(output, midi);
   const stats = { ...result, output };

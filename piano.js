@@ -702,6 +702,7 @@ export function finalizeNotes(notes, tempo = estimateTempo(notes), options = {})
       : Math.min(1, Math.max(0.05, note.amplitude)),
     ...(note.onset === undefined ? {} : { onset: note.onset }),
     ...(note.role === undefined ? {} : { role: note.role }),
+    ...(note.source === undefined ? {} : { source: note.source }),
     ...(note.chordTones === undefined ? {} : { chordTones: note.chordTones }),
     ...(note.registerLow === undefined ? {} : { registerLow: note.registerLow }),
     ...(note.registerHigh === undefined ? {} : { registerHigh: note.registerHigh }),

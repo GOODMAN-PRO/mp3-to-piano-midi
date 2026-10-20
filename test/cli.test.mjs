@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, statSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, statSync, rmSync, existsSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { registerHooks } from 'node:module';
-import { spawnSync } from 'node:child_process';
+import { registerHooks, syncBuiltinESMExports } from 'node:module';
+import childProcess, { spawnSync } from 'node:child_process';
+import { cleanNotes } from '../piano.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const cacheDir = join(root, '.cache');
@@ -13,7 +14,7 @@ const temporary = mkdtempSync(join(cacheDir, 'cli-synthetic-'));
 assert.equal(dirname(resolve(temporary)), resolve(cacheDir));
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const input = join(temporary, `${basename(temporary)}.wav`);
-let cachePath, vocalPath, runtimeImports = 0;
+let cachePath, classicCachePath, vocalPath, runtimeImports = 0;
 const hook = registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === 'onnxruntime-node') {
@@ -27,9 +28,20 @@ const hook = registerHooks({
 });
 const savedError = console.error;
 try {
-  const { convertFile } = await import('../cli.mjs');
+  const { convertFile, STEREO_DECODE_VERSION, legacyStereoDecodeSafe } = await import('../cli.mjs');
   assert.equal(runtimeImports, 0, 'Importing the CLI must not load the optional runtime');
   console.error = () => {};
+  for (const sample_fmt of ['s16', 's16p', 's32', 'u8']) {
+    assert.equal(legacyStereoDecodeSafe({ channels: 6, sample_fmt }), false);
+    assert.equal(legacyStereoDecodeSafe({ channels: 1, sample_fmt }), true);
+    assert.equal(legacyStereoDecodeSafe({ channels: 2, sample_fmt }), true);
+  }
+  for (const sample_fmt of ['flt', 'fltp', 'dbl', 'dblp']) {
+    assert.equal(legacyStereoDecodeSafe({ channels: 6, sample_fmt }), true);
+  }
+  assert.equal(legacyStereoDecodeSafe(), false);
+  assert.equal(legacyStereoDecodeSafe({ channels: 6 }), false);
+  assert.equal(legacyStereoDecodeSafe({ channels: 0, sample_fmt: 'fltp' }), false);
 
   const wav = Buffer.alloc(44 + 512 * 4);
   wav.write('RIFF'); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
@@ -64,11 +76,16 @@ try {
     input, mtimeMs: source.mtimeMs, modelStamp: statSync(join(root, 'public/model/model.json')).mtimeMs,
     pipelineHash: hash(Buffer.concat(['fft.js', 'separate.js', 'melody.js'].map(name => readFileSync(join(root, name))))),
     modelHash: 'ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b',
+    stereoDecodeVersion: STEREO_DECODE_VERSION,
     frames, onsets, melody, duration: 6.4, provider: 'cpu', stemPaths,
     stemHashes: stemPaths.map(path => hash(readFileSync(path))),
     timings: { decode: 1, separation: 2, melody: 3, basicPitch: 4 },
   };
   writeFileSync(cachePath, JSON.stringify(record));
+  classicCachePath = join(cacheDir, `${basename(input)}-${source.size}.json`);
+  writeFileSync(classicCachePath, JSON.stringify({
+    input, mtimeMs: source.mtimeMs, modelStamp: record.modelStamp, frames, onsets,
+  }));
   writeFileSync(vocalPath, new Uint8Array(new Float32Array(22050).buffer));
   const options = { quantize: false, chordsOnly: true };
 
@@ -108,6 +125,72 @@ try {
   assert.equal(forcedStats.melodyLeftShare, 0);
   assert.equal(forcedStats.melodyMedianPitch, 64);
 
+  // Explicit flags for the other mode must warn individually, leave MIDI
+  // unchanged, and never masquerade as effective JSON parameters.
+  const classicIgnored = [
+    ['--preset', 'easy', 'preset'], ['--poly', '2', 'poly'],
+    ['--max-sounding', '2', 'maxSounding'], ['--split-at', '70', 'splitAt'],
+    ['--melody', '0', 'melody'], ['--min-sounding', '400', 'minSounding'],
+    ['--legato-gap', '500', 'legatoGap'], ['--wobble', '500', 'wobble'],
+    ['--no-dynamics', null, 'dynamics'],
+  ];
+  const stemsIgnored = [
+    ['--keep-stems', join(temporary, 'ignored-stems'), 'keepStems'], ['--ep', 'cpu', 'ep'],
+    ['--theta', '0.9', 'theta'], ['--split-db', '99', 'splitDb'],
+    ['--lh-groove', '0.9', 'lhGroove'], ['--rh-legato', '0', 'rhLegato'],
+    ['--chords-only', null, 'chordsOnly'], ['--melody-hand', 'left', 'melodyHand'],
+    ['--melody-octave', '-1', 'melodyOctave'],
+  ];
+  for (const [classic, ignored] of [[false, classicIgnored], [true, stemsIgnored]]) {
+    const target = join(temporary, classic ? 'classic-ignored.mid' : 'stems-ignored.mid');
+    const args = [join(root, 'cli.mjs'), input, ...(classic ? ['--classic'] : []),
+      ...ignored.flatMap(([flag, value]) => value === null ? [flag] : [flag, value]),
+      '--align', '0', '--key-clean', '0', '--no-quantize', '--out', target, '--json'];
+    const child = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true });
+    assert.ifError(child.error);
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    for (const [flag, , key] of ignored) {
+      assert.ok(child.stderr.includes(`Warning: ${flag} ignored in ${classic ? 'Classic' : 'stems'} mode`), flag);
+      assert.equal(Object.hasOwn(result.parameters, key), false, `${key} is not an effective option`);
+    }
+    assert.equal(child.stderr.includes('Warning: --align'), false, 'Alignment remains shared cleanup');
+    assert.equal(child.stderr.includes('Warning: --key-clean'), false, 'Key cleanup remains shared');
+    assert.equal(result.parameters.align, 0);
+    assert.equal(result.parameters.keyClean, 0);
+    const baseline = await convertFile(input, { classic, align: 0, keyClean: 0, quantize: false });
+    assert.deepEqual(readFileSync(target), Buffer.from(baseline.midi));
+    if (classic) {
+      assert.equal(result.noBackingPct, null);
+      assert.equal(result.longestNoBackingSeconds, null);
+      assert.equal(existsSync(join(temporary, 'ignored-stems')), false, '--classic must not export ignored stems');
+    }
+  }
+  // The unchanged output of one real song does not make --align an ignored
+  // option: this shared cleanup fixture exercises two staggered chord attacks.
+  const staggered = [
+    { pitchMidi: 60, startTimeSeconds: 0, durationSeconds: 1, amplitude: 0.8 },
+    { pitchMidi: 64, startTimeSeconds: 0.02, durationSeconds: 1, amplitude: 0.8 },
+  ];
+  assert.equal(cleanNotes(staggered, { align: 0 })[1].startTimeSeconds, 0.02);
+  assert.equal(cleanNotes(staggered, { align: 30 })[1].startTimeSeconds, 0);
+
+  writeFileSync(cachePath, JSON.stringify({ ...record, melody: melody.slice(0, 5) }));
+  const fallback = await convertFile(input, options);
+  assert.equal(fallback.piano.noVocals, true);
+  assert.equal(fallback.stats.vocalMedianPitch, null, 'Discarded leakage is not a measured vocal register');
+  assert.equal(fallback.stats.fallbackUsed, true);
+  assert.equal(fallback.stats.fallbackCacheHit, true, 'Fallback reuses original-mix inference independently');
+  assert.equal(fallback.stats.cacheHit, true);
+  assert.ok(fallback.stats.timings.fallbackBasicPitch >= 0);
+  assert.ok(fallback.stats.timings.fallbackExtraction >= 0);
+  assert.equal(Object.hasOwn(fallback.stats.parameters, 'fallbackNotes'), false);
+  const ignoredFallbackOptions = Object.fromEntries(classicIgnored.map(([flag, value, key]) =>
+    [key, flag === '--no-dynamics' ? false : key === 'preset' ? value : Number(value)]));
+  const sameFallback = await convertFile(input, { ...options, ...ignoredFallbackOptions });
+  assert.deepEqual(sameFallback.midi, fallback.midi, 'Classic-only flags must also be ignored in fallback melody selection');
+  writeFileSync(cachePath, initialCache);
+
   const adjusted = await convertFile(input, { ...options, onset: 0.999, frame: 0.99, lhGroove: 0.9 });
   assert.equal(adjusted.stats.cacheHit, true);
   assert.equal(adjusted.stats.timings.basicPitch, 0);
@@ -141,6 +224,38 @@ try {
   }
   assert.equal(runtimeImports, 0);
 
+  // Exercise migration through convertFile without requiring ffprobe in CI.
+  // Integer surround must request regeneration; floating surround keeps valid
+  // inference and is marked so subsequent calls no longer probe it.
+  const nativeSpawn = childProcess.spawnSync;
+  let probes = 0, sampleFormat = 's16';
+  const { stereoDecodeVersion: previousVersion, ...legacyRecord } = movedRecord;
+  childProcess.spawnSync = (command, args) => {
+    assert.equal(command, 'ffprobe', 'A valid cache migration must not decode or transcribe');
+    assert.ok(args.includes('stream=channels,sample_fmt'));
+    probes++;
+    return { status: 0, stdout: Buffer.from(JSON.stringify({
+      streams: [{ channels: 6, sample_fmt: sampleFormat }],
+    })), stderr: Buffer.alloc(0) };
+  };
+  syncBuiltinESMExports();
+  try {
+    writeFileSync(cachePath, JSON.stringify(legacyRecord));
+    await assert.rejects(convertFile(input, options), /needs optional onnxruntime-node/,
+      'A legacy integer-surround cache cannot silently retain wrapped samples');
+    assert.equal(probes, 1);
+    sampleFormat = 'fltp';
+    const migrated = await convertFile(input, options);
+    assert.equal(migrated.stats.cacheHit, true);
+    assert.equal(probes, 2);
+    assert.equal(JSON.parse(readFileSync(cachePath)).stereoDecodeVersion, STEREO_DECODE_VERSION);
+    await convertFile(input, options);
+    assert.equal(probes, 2, 'Validated caches are not probed again');
+  } finally {
+    childProcess.spawnSync = nativeSpawn;
+    syncBuiltinESMExports();
+  }
+
   // A different song may have overwritten an export directory. Its bytes must
   // fail the saved SHA check and request regeneration, never be silently copied.
   writeFileSync(join(kept, 'vocals.wav'), backingWav);
@@ -156,6 +271,9 @@ try {
 
   for (const [args, expectedStatus, text] of [
     [['--help'], 0, /Default: separate vocals/],
+    [['--help'], 0, /Both modes:.*--align.*--key-clean/],
+    [['--help'], 0, /Classic only \(--classic\):.*--preset.*--no-dynamics/],
+    [['--help'], 0, /Stems only \(default\):.*--melody-hand.*--melody-octave/],
     [[input, '--ep', 'invalid'], 1, /--ep must be dml or cpu/],
     [[input, '--theta', 'NaN'], 1, /needs a finite number/],
     [[input, '--keep-stems'], 1, /--keep-stems needs a value/],
@@ -175,6 +293,7 @@ try {
   console.error = savedError;
   hook.deregister();
   if (cachePath) rmSync(cachePath, { force: true });
+  if (classicCachePath) rmSync(classicCachePath, { force: true });
   if (vocalPath) rmSync(vocalPath, { force: true });
   // The directory was created above with mkdtemp, and its resolved parent was checked.
   rmSync(temporary, { recursive: true, force: true });

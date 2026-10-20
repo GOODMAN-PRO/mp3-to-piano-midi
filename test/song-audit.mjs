@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import midiPackage from '@tonejs/midi/build/Midi.js';
+import { backingCoverage } from '../backing-metrics.js';
 
 // Audit exported MIDI, where rounding and cross-track note-off ordering matter.
 export function auditMidi(bytes) {
@@ -66,11 +67,29 @@ export function runSongAudit(directory = resolve(import.meta.dirname, '../.cache
     console.log('SKIP listening MIDI audit: local .cache/listen directory is absent.');
     return [];
   }
-  const files = readdirSync(directory).filter(file => /-(stems|cover)\.mid$/i.test(file)).sort();
+  const files = readdirSync(directory).filter(file => /-(stems(?:-left-oct-1)?|cover)\.mid$/i.test(file)).sort();
   if (!files.length) console.log('SKIP listening MIDI audit: no local stems/cover MIDI pairs found.');
-  const results = files.map(file => ({ file, ...auditMidi(readFileSync(resolve(directory, file))) }));
+  const results = files.map(file => {
+    const result = { file, ...auditMidi(readFileSync(resolve(directory, file))) };
+    const sidecar = resolve(directory, file.replace(/\.mid$/i, '-notes.json'));
+    if (existsSync(sidecar)) {
+      const data = JSON.parse(readFileSync(sidecar, 'utf8'));
+      // MIDI does not encode melody/accompaniment roles or inferred chords.
+      // Coverage comes from the labelled arrangement sidecar; invariants above
+      // are checked separately on the actual exported bytes.
+      Object.assign(result, backingCoverage(data.notes, data.chords, data.stats?.timingOffsetSeconds ?? 0));
+      result.coverageSource = result.noBackingPct === null ? null : 'arrangement-sidecar';
+      result.clashPct = data.stats?.clashPct ?? null;
+    }
+    return result;
+  });
   for (const result of results) console.log(JSON.stringify(result));
   assert.ok(results.every(result => result.pass), 'Listening MIDI invariant audit failed; see per-file counts.');
+  assert.ok(results.every(result => !/-stems(?:-left-oct-1)?\.mid$/i.test(result.file) ||
+    result.coverageSource === 'arrangement-sidecar'),
+  'Stems MIDI needs a matching arrangement sidecar with chord metadata for the coverage audit.');
+  assert.ok(results.every(result => result.noBackingPct == null || result.noBackingPct <= 5),
+    'Non-N chord time without backing exceeds 5%; see per-file coverage.');
   console.log(`Listening MIDI audit: ${results.length} files passed.`);
   return results;
 }

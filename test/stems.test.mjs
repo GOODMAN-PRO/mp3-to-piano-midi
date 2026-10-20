@@ -3,6 +3,8 @@ import { arrangeStems, assignMelodyHands, enforcePlayability, filterClashes, gro
   weightedMedianPitch, stemsDefaults } from '../stems.js';
 import { noteStats, stemsDefaults as cliStemsDefaults } from '../cli.mjs';
 import { notesToMidi } from '../midi.js';
+import { backingCoverage } from '../backing-metrics.js';
+import { auditMidi } from './song-audit.mjs';
 import midiPackage from '@tonejs/midi';
 
 const note = (pitch, start, length, amplitude = 0.8) => ({
@@ -23,7 +25,8 @@ assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'right']);
 assert.ok(assignment.notes.slice(0, 10).every(n => n.pitch === 52));
 assignment = assignMelodyHands([...phrase(52, 0), ...phrase(58, 7), ...phrase(72, 14), ...phrase(58, 21)], noGrid);
 assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'left', 'right', 'right']);
-assert.equal(assignMelodyHands(phrase(59, 0)).phrases[0].hand, 'right');
+assert.equal(assignMelodyHands(phrase(59, 0)).phrases[0].hand, 'left',
+  'A vocal median below 59.5 seeds the boundary band in the left hand');
 assert.equal(assignMelodyHands(phrase(58, 0)).phrases[0].hand, 'left');
 assignment = assignMelodyHands([...phrase(52, 0), ...phrase(72, 6.5, 1), ...phrase(52, 9)], noGrid);
 assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'left', 'left'], 'A short high phrase cannot flip the hand');
@@ -45,6 +48,77 @@ assert.throws(() => assignMelodyHands([], noGrid, { melodyOctave: 2 }), /melodyO
 const rests = [note(52, 0, 1), note(72, 2.2, 1)];
 assert.equal(assignMelodyHands(rests, noGrid).phrases.length, 2);
 assert.equal(assignMelodyHands(rests, { ...grid, estimatedBpm: 60 }).phrases.length, 1, 'Accepted tempo uses two beats');
+
+const sourcedPhrase = (pitch, start, length, source) =>
+  phrase(pitch, start, length).map(n => ({ ...n, source }));
+for (const [pitch, hand] of [[58, 'left'], [62, 'right']]) {
+  const vocals = [...sourcedPhrase(pitch, 14, 7, 'vocal'), ...sourcedPhrase(pitch, 23, 5, 'vocal')];
+  const alone = assignMelodyHands(vocals, noGrid);
+  const withIntro = assignMelodyHands([...sourcedPhrase(76, 0, 12, 'instrumental'), ...vocals], noGrid);
+  assert.equal(withIntro.vocalDecisionMedianPitch, pitch);
+  assert.deepEqual(withIntro.phrases.filter(p => p.source === 'vocal').map(p => p.hand),
+    alone.phrases.map(p => p.hand), 'An instrumental intro must not seed the sung melody hand');
+  assert.ok(withIntro.notes.filter(n => n.source === 'vocal').every(n => n.hand === hand));
+  assert.ok(withIntro.notes.filter(n => n.source === 'instrumental').every(n => n.hand === 'right'));
+}
+assignment = assignMelodyHands([...phrase(58, 0), ...phrase(62, 7, 10)], noGrid);
+assert.equal(assignment.vocalDecisionMedianPitch, 62);
+assert.deepEqual(assignment.phrases.map(p => p.hand), ['right', 'right'],
+  'The whole vocal line seeds a first boundary-band phrase, not its first phrase alone');
+assignment = assignMelodyHands([
+  ...sourcedPhrase(52, 0, 5, 'vocal'),
+  ...sourcedPhrase(76, 5, 5, 'instrumental'),
+  ...sourcedPhrase(58, 10, 5, 'vocal'),
+], noGrid);
+assert.deepEqual(assignment.phrases.map(p => [p.source, p.hand]),
+  [['vocal', 'left'], ['instrumental', 'right'], ['vocal', 'left']],
+  'Source changes split adjacent phrases and a high fallback cannot change the vocal state');
+assignment = assignMelodyHands([
+  ...sourcedPhrase(62, 0, 5, 'vocal'),
+  ...sourcedPhrase(52, 7, 5, 'instrumental'),
+  ...sourcedPhrase(58, 14, 5, 'vocal'),
+], noGrid);
+assert.deepEqual(assignment.phrases.map(p => p.hand), ['right', 'left', 'right'],
+  'A low fallback cannot reset an established right-hand vocal state');
+for (const [vocalPitch, hand] of [[52, 'left'], [72, 'right']]) for (const fallbackPitch of [58, 59]) {
+  assignment = assignMelodyHands([
+    ...sourcedPhrase(vocalPitch, 0, 5, 'vocal'),
+    ...sourcedPhrase(fallbackPitch, 7, 5, 'instrumental'),
+    ...sourcedPhrase(vocalPitch, 14, 5, 'vocal'),
+  ], noGrid);
+  assert.equal(assignment.phrases[1].hand, hand,
+    'A boundary-band fallback adopts matching vocal hands on either side');
+}
+assignment = assignMelodyHands([
+  ...sourcedPhrase(52, 0, 1, 'vocal'),
+  ...sourcedPhrase(52, 2.5, 5, 'instrumental'),
+  ...sourcedPhrase(62, 9, 5, 'vocal'),
+], noGrid);
+assert.deepEqual(assignment.phrases.map(p => p.hand), ['right', 'left', 'right'],
+  'A short vocal phrase shares the next vocal decision, excluding an intervening fallback');
+assert.equal(assignment.phrases[0].decisionMedianPitch, 62);
+assignment = assignMelodyHands([
+  ...sourcedPhrase(52, 0, 2, 'vocal'),
+  ...sourcedPhrase(76, 3.5, 2, 'instrumental'),
+  ...sourcedPhrase(53, 7, 2, 'vocal'),
+  ...sourcedPhrase(76, 10.5, 2, 'instrumental'),
+  ...sourcedPhrase(72, 14, 2, 'vocal'),
+  ...sourcedPhrase(74, 18, 2, 'vocal'),
+], noGrid);
+assert.deepEqual(assignment.phrases.filter(p => p.source === 'vocal').map(p => p.hand),
+  ['left', 'left', 'right', 'right'], 'Pairs of short vocal phrases must exclude fallback phrases');
+assignment = assignMelodyHands([
+  ...sourcedPhrase(76, 0, 5, 'instrumental'), ...sourcedPhrase(70, 7, 5, 'vocal'),
+], noGrid, { melodyOctave: -1 });
+assert.equal(assignment.vocalDecisionMedianPitch, 58);
+assert.ok(assignment.notes.filter(n => n.source === 'vocal').every(n => n.pitch === 58 && n.hand === 'left'),
+  'The vocal-only seed uses the octave-shifted register');
+for (const melodyHand of ['left', 'right']) for (const melodyOctave of [-1, 0, 1]) {
+  const mixed = [...sourcedPhrase(72, 0, 5, 'instrumental'), ...sourcedPhrase(58, 5, 5, 'vocal')];
+  const forced = assignMelodyHands(mixed, noGrid, { melodyHand, melodyOctave });
+  assert.ok(forced.notes.every((n, i) => n.hand === melodyHand && n.pitch === mixed[i].pitch + 12 * melodyOctave),
+    'Source-aware Auto decisions must not change forced hand or octave controls');
+}
 
 const harmonyNotes = [];
 for (const [i, pitches] of [[48, 52, 55], [43, 47, 50], [45, 48, 52], [41, 45, 48]].entries()) {
@@ -120,6 +194,64 @@ const options = { quantize: false, tempo: noGrid, harmonic: 0, ghost: 0, keyClea
   align: 0, chordsOnly: true };
 const voice = (pitch, start = 0) => Array.from({ length: 20 }, (_, i) => note(pitch, start + i * 0.3, 0.27));
 const backing = Array.from({ length: 12 }, (_, i) => [48, 52, 55].map(p => note(p, i * 0.5, 0.48))).flat();
+const assertBacking = output => {
+  const backing = output.filter(n => n.role !== 'melody'), stats = noteStats(output);
+  for (const chord of output.chords.filter(c => c.label !== 'N')) {
+    assert.ok(backing.some(n => n.startTimeSeconds < chord.end && n.end > chord.start),
+      `${chord.label} at ${chord.start} must have backing`);
+  }
+  assert.ok(backingCoverage(output).noBackingPct <= 5, JSON.stringify(backingCoverage(output)));
+  assert.equal(stats.clashPct, 0);
+  assert.equal(stats.handSpanViolations, 0);
+  assert.equal(stats.handPolyViolations, 0);
+  assert.ok(stats.maxSoundingAtOnce <= 4);
+  assert.ok(output.every(n => Number.isFinite(n.pitch) && n.durationSeconds > 0));
+  assert.equal(auditMidi(notesToMidi(output)).pass, true);
+};
+for (let root = 0; root < 12; root++) {
+  const power = Array.from({ length: 12 }, (_, i) =>
+    [48 + root, 55 + root].map(p => note(p, i * 0.5, 0.48))).flat();
+  const output = arrangeStems(voice(72 + root), power, { ...options, melodyHand: 'right', chordsOnly: false });
+  assert.ok(output.chords.some(chord => chord.root === root && chord.label.endsWith('5')),
+    `The fixture must exercise the power chord on pitch class ${root}`);
+  assertBacking(output);
+}
+// One long LH phrase reaches G5 only briefly. A high peak must not decide
+// every chord's floor, nor remove a whole long power-chord accompaniment.
+const peaks = Array.from({ length: 80 }, (_, i) => note(i === 18 || i === 54 ? 79 : i % 7 === 0 ? 57 : 53,
+  i * 0.3, 0.27));
+const longPower = Array.from({ length: 48 }, (_, i) => [51, 58].map(p => note(p, i * 0.5, 0.48))).flat();
+for (const melodyHand of ['auto', 'left']) {
+  const output = arrangeStems(peaks, longPower, { ...options, melodyHand });
+  assert.equal(output.melodyLeftShare, 1);
+  assertBacking(output);
+  assert.ok(output.some(n => n.role !== 'melody' && n.hand === 'right' && n.pitch <= 72),
+    'Ordinary low melody stretches retain backing in the normal RH register');
+  for (const n of output.filter(n => n.role !== 'melody')) for (const m of output.filter(n => n.role === 'melody')) {
+    if (n.startTimeSeconds >= m.end - 1e-9 || m.startTimeSeconds >= n.end - 1e-9) continue;
+    assert.ok(n.hand === 'right' ? n.pitch >= Math.max(60, m.pitch + 3) :
+      m.pitch - n.pitch >= 3 && m.pitch - n.pitch <= 14);
+  }
+}
+const forcedHigh = arrangeStems(voice(79), backing, { ...options, melodyHand: 'left' });
+assertBacking(forcedHigh);
+assert.ok(forcedHigh.filter(n => n.role !== 'melody').every(n => n.hand === 'left' && n.role === 'bass'),
+  'When nothing fits above a forced high LH melody, one safe tone below it preserves backing');
+const afterPeak = arrangeStems(voice(79),
+  Array.from({ length: 20 }, (_, i) => (i < 14 ? [48, 52, 55] : [50, 54, 57])
+    .map(p => note(p, i * 0.5, 0.49))).flat(),
+  { ...options, melodyHand: 'left', fallbackNotes: [], durationSeconds: 10 });
+assertBacking(afterPeak);
+assert.ok(afterPeak.some(n => n.role !== 'melody' && n.hand === 'right' && n.startTimeSeconds >= 7),
+  'A finished high LH phrase must not raise the RH floor through a later empty melody section');
+const forcedLow = arrangeStems(voice(38),
+  Array.from({ length: 12 }, (_, i) => [40, 44, 47].map(p => note(p, i * 0.5, 0.48))).flat(),
+  { ...options, melodyHand: 'right' });
+assertBacking(forcedLow);
+assert.ok(forcedLow.filter(n => n.role !== 'melody').every(n =>
+  n.hand === 'right' && n.pitch >= 41 && n.pitch <= 52),
+  'When nothing fits below a forced low RH melody, one safe tone above it preserves backing');
+assert.ok(forcedLow.filter(n => n.role === 'melody').every(n => n.hand === 'right' && n.pitch === 38));
 for (const pitch of [52, 72]) for (const quantize of [false, true]) {
   const output = arrangeStems(voice(pitch), backing, { ...options, quantize, tempo: quantize ? grid : noGrid });
   const melody = output.filter(n => n.role === 'melody'), accompaniment = output.filter(n => n.role !== 'melody');

@@ -131,9 +131,9 @@ async function decode(file, stems, job) {
   return { mix, duration: buffer.duration };
 }
 
-async function transcribe(audio, job, stems) {
-  const label = stems ? 'backing' : 'audio', frames = [], onsets = [];
-  const base = stems ? 0.60 : 0.03, width = stems ? 0.32 : 0.89;
+async function transcribe(audio, job, stems, stage = {}) {
+  const label = stage.label ?? (stems ? 'backing' : 'audio'), frames = [], onsets = [];
+  const base = stage.base ?? (stems ? 0.60 : 0.03), width = stage.width ?? (stems ? 0.32 : 0.89);
   report(job, base, 'Loading transcription model…');
   // Created only after session.release() AND separator Worker termination.
   const model = await tf.loadGraphModel(import.meta.env.BASE_URL + 'model/model.json', {
@@ -259,9 +259,25 @@ form.addEventListener('submit', async event => {
       { frames, onsets, options: extractionOptions });
     report(job, 0.95, 'Arranging piano MIDI…');
     await tick(); check(job);
-    const piano = stems
+    let piano = stems
       ? arrangeStems(melody, extracted.notes, { ...pianoDefaults, ...stemsOptions, durationSeconds: decoded.duration })
       : toPianoNotes(extracted.notes, { ...pianoDefaults, maxSounding: defaultMaxSounding(preset), maxPoly, preset, quantize });
+    if (stems && piano.needsFallback) {
+      // Separation can remove an instrumental lead along with vocals. For
+      // unvoiced sections, recover Classic's candidates from the retained mix.
+      failureMessage = 'Could not transcribe the fallback melody. Try a shorter audio file.';
+      const fallback = await transcribe(decoded.mix, job, false,
+        { label: 'instrumental melody from the mix', base: 0.95, width: 0.025 });
+      report(job, 0.975, 'Extracting fallback melody…');
+      const fallbackResult = await runWorker(job,
+        new Worker(new URL('./extract.worker.js', import.meta.url), { type: 'module' }),
+        { ...fallback, options: { ...extractionOptions, melodiaTrick: true } });
+      report(job, 0.99, 'Arranging piano MIDI…');
+      await tick(); check(job);
+      failureMessage = 'Could not create the MIDI file. Try converting again.';
+      piano = arrangeStems(melody, extracted.notes, { ...pianoDefaults, ...stemsOptions,
+        durationSeconds: decoded.duration, fallbackNotes: fallbackResult.notes });
+    }
     check(job);
     const blob = new Blob([notesToMidi(piano, { splitHands: stems || splitHands })], { type: 'audio/midi' });
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);

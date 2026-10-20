@@ -1,4 +1,4 @@
-import { cleanNotes, estimateKey, estimateTempo, finalizeNotes, trackMelody } from './piano.js';
+import { cleanNotes, estimateKey, estimateTempo, finalizeNotes, trackMelody, toPianoNotes, pianoDefaults } from './piano.js';
 
 // Browser, CLI and direct callers use the same stems controls.
 export const stemsDefaults = Object.freeze({
@@ -47,54 +47,71 @@ export function groupBy30(notes) {
   return groups;
 }
 
-// A short phrase shares its nearest >=4 s neighbour's decision. If every phrase
-// is short, adjacent phrases decide together; a trailing singleton joins the
-// preceding pair. An explicit octave shift precedes folding and hand assignment.
+// Vocal hysteresis is independent of instrumental fallback. Short vocal phrases
+// share a vocal neighbour's decision. Octave shifting still precedes assignment.
 export function assignMelodyHands(notes, tempo = {}, options = {}) {
   const melodyHand = options.melodyHand ?? stemsDefaults.melodyHand;
   const melodyOctave = options.melodyOctave ?? stemsDefaults.melodyOctave;
   if (!['auto', 'left', 'right'].includes(melodyHand)) throw new Error('melodyHand must be auto, left or right.');
   if (![-1, 0, 1].includes(melodyOctave)) throw new Error('melodyOctave must be -1, 0 or 1.');
-  const line = internal(notes).map(n => ({ ...n, pitch: fold(n.pitch + 12 * melodyOctave), role: 'melody' }));
+  const line = internal(notes).map(n => ({ ...n, pitch: fold(n.pitch + 12 * melodyOctave), role: 'melody',
+    source: n.source === 'instrumental' ? 'instrumental' : 'vocal' }));
+  const vocalDecisionMedianPitch = weightedMedianPitch(line.filter(n => n.source === 'vocal'));
   const rest = tempo.eligible ? 2 * 60 / tempo.estimatedBpm : 1;
   const phrases = [];
   for (const n of line) {
     let phrase = phrases.at(-1);
-    if (!phrase || n.startTimeSeconds - phrase.end >= rest - 1e-9) {
-      phrase = { start: n.startTimeSeconds, end: n.end, notes: [] };
+    if (!phrase || n.startTimeSeconds - phrase.end >= rest - 1e-9 ||
+      melodyHand === 'auto' && phrase.source !== n.source) {
+      phrase = { start: n.startTimeSeconds, end: n.end, notes: [], source: n.source };
       phrases.push(phrase);
     }
+    if (phrase.source !== n.source) phrase.source = 'mixed';
     phrase.notes.push(n);
     phrase.end = Math.max(phrase.end, n.end);
   }
-  const anchors = phrases.map((p, i) => p.end - p.start >= 4 - 1e-9 ? i : -1).filter(i => i >= 0);
+  // Forced hands retain their original phrase boundaries and backing behavior.
+  const vocalPhrases = melodyHand === 'auto' ? phrases.filter(p => p.source === 'vocal') : phrases;
+  const anchors = vocalPhrases.map((p, i) => p.end - p.start >= 4 - 1e-9 ? i : -1).filter(i => i >= 0);
   const groups = new Map();
-  phrases.forEach((p, i) => {
-    let owner = anchors[0] ?? Math.min(2 * Math.floor(i / 2), Math.max(0, 2 * Math.floor((phrases.length - 2) / 2)));
+  vocalPhrases.forEach((p, i) => {
+    let owner = anchors[0] ?? Math.min(2 * Math.floor(i / 2), Math.max(0, 2 * Math.floor((vocalPhrases.length - 2) / 2)));
     let distance = Infinity;
     for (const j of anchors) {
-      const d = j < i ? p.start - phrases[j].end : j > i ? phrases[j].start - p.end : 0;
+      const d = j < i ? p.start - vocalPhrases[j].end : j > i ? vocalPhrases[j].start - p.end : 0;
       if (d < distance) { owner = j; distance = d; }
     }
     if (!groups.has(owner)) groups.set(owner, []);
     groups.get(owner).push(i);
   });
-  let previous;
+  let previous = vocalDecisionMedianPitch >= 59.5 ? 'right' : 'left';
   for (const indices of [...groups.values()].sort((a, b) => a[0] - b[0])) {
-    const m = weightedMedianPitch(indices.flatMap(i => phrases[i].notes));
+    const m = weightedMedianPitch(indices.flatMap(i => vocalPhrases[i].notes));
     const hand = melodyHand !== 'auto' ? melodyHand :
-      m >= 60 ? 'right' : m <= 57 ? 'left' : previous ?? (m >= 59 ? 'right' : 'left');
+      m >= 60 ? 'right' : m <= 57 ? 'left' : previous;
     for (const i of indices) {
-      const p = phrases[i];
+      const p = vocalPhrases[i];
       p.hand = hand;
-      p.medianPitch = weightedMedianPitch(p.notes);
       p.decisionMedianPitch = m;
-      p.maxPitch = Math.max(...p.notes.map(n => n.pitch));
-      for (const n of p.notes) { n.hand = hand; n.phraseMaxPitch = p.maxPitch; }
     }
     previous = hand;
   }
-  return { notes: line, phrases };
+  for (const p of phrases) {
+    p.medianPitch = weightedMedianPitch(p.notes);
+    p.maxPitch = Math.max(...p.notes.map(n => n.pitch));
+    if (melodyHand === 'auto' && p.source === 'instrumental') {
+      const before = vocalPhrases.findLast(v => v.end <= p.start);
+      const after = vocalPhrases.find(v => v.start >= p.end);
+      // Fallback has no state of its own to carry into the next vocal phrase.
+      p.hand = p.medianPitch >= 60 ? 'right' : 'left';
+      if (p.medianPitch >= 58 && p.medianPitch <= 59 && before && after && before.hand === after.hand) {
+        p.hand = before.hand;
+      }
+      p.decisionMedianPitch = p.medianPitch;
+    }
+    for (const n of p.notes) { n.hand = p.hand; n.phraseMaxPitch = p.maxPitch; }
+  }
+  return { notes: line, phrases, vocalDecisionMedianPitch };
 }
 
 const templates = [
@@ -242,9 +259,23 @@ function leftVoicing(segment, previous) {
     for (let a = bass + 3; a <= Math.min(59, bass + 14); a++) for (let b = a + 3; b <= Math.min(59, bass + 14); b++) {
       if (!(pc(a) === voices[0] && pc(b) === voices[1] || pc(a) === voices[1] && pc(b) === voices[0])) continue;
       const cost = Math.abs(bass - (previous?.[0] ?? 45)) + 0.15 * Math.abs(bass - 45) +
-        (previous ? 0.7 * (Math.abs(a - previous[1]) + Math.abs(b - previous[2])) : 0) +
+        (previous ? 0.7 * (Math.abs(a - (previous[1] ?? previous[0])) +
+          Math.abs(b - (previous[2] ?? previous.at(-1)))) : 0) +
         0.05 * Math.abs((a + b) / 2 - 54);
       if (!best || cost < best.cost) best = { pitches: [bass, a, b], cost };
+    }
+  }
+  if (!best) {
+    // C..Eb power-chord basses cannot fit their octave below MIDI 60.
+    const upper = tones.find(p => p !== bassPc);
+    if (upper !== undefined) for (let bass = 40; bass <= 52; bass++) {
+      if (pc(bass) !== bassPc) continue;
+      for (let a = bass + 3; a <= Math.min(59, bass + 14); a++) {
+        if (pc(a) !== upper) continue;
+        const cost = Math.abs(bass - (previous?.[0] ?? 45)) + 0.15 * Math.abs(bass - 45) +
+          (previous ? 0.7 * Math.abs(a - (previous[1] ?? previous[0])) : 0) + 0.05 * Math.abs(a - 54);
+        if (!best || cost < best.cost) best = { pitches: [bass, a], cost };
+      }
     }
   }
   return best?.pitches ?? [];
@@ -266,7 +297,7 @@ function rightVoicing(segment, low, previous) {
       if (!best || cost < best.cost) best = { pitches, cost };
     }
   }
-  return best?.pitches ?? [];
+  return best?.pitches ?? choices.slice(0, 1);
 }
 
 function attacksFor(segment, inst, harmony, groove) {
@@ -295,16 +326,60 @@ function accompaniment(inst, line, phrases, harmony, options) {
   const amps = inst.map(n => n.amplitude).sort((a, b) => a - b), p95 = amps[Math.floor(0.95 * (amps.length - 1))] || 1;
   const phraseAt = time => phrases.findLast(p => p.start <= time + 1e-9) ?? phrases[0] ??
     { hand: 'right', maxPitch: 60 };
+  const voiceSegment = segment => {
+    const phrase = phraseAt(segment.start), hand = phrase.hand === 'right' ? 'left' : 'right';
+    const near = line.filter(n => n.end > segment.start - 0.3 && n.startTimeSeconds < segment.end + 0.3);
+    const top = near.length ? Math.max(...near.map(n => n.pitch)) : 57;
+    const low = hand === 'right' ? Math.max(60, top + 3) : 40;
+    const pitches = hand === 'left' ? leftVoicing(segment, previous.left) : rightVoicing(segment, low, previous.right);
+    const sounding = line.filter(n => n.startTimeSeconds < segment.end - 1e-9 && n.end > segment.start + 1e-9);
+    const candidates = pitches.map((pitch, i) => ({
+      pitch, startTimeSeconds: segment.start, end: segment.end, hand, role: i ? 'accompaniment' : 'bass',
+      chordTones: segment.tones, registerLow: low, registerHigh: hand === 'right' ? 81 : i ? 59 : 52,
+      placement: hand === 'right' ? 'above' : 'below',
+    }));
+    const safe = filterClashes([...sounding, ...candidates]).filter(n => n.role !== 'melody');
+    if (safe.length) return { hand, low, pitches: [...new Set(safe.map(n => n.pitch))].sort((a, b) => a - b), shared: false };
+    return { hand, low, pitches: [], shared: false };
+  };
+  const sharedTone = segment => {
+    const hand = phraseAt(segment.start).hand;
+    const sounding = line.filter(n => n.startTimeSeconds < segment.end - 1e-9 && n.end > segment.start + 1e-9);
+    const near = sounding.length ? sounding :
+      line.filter(n => n.end > segment.start - 0.3 && n.startTimeSeconds < segment.end + 0.3);
+    if (!near.length || near.some(n => n.hand !== hand)) return null;
+    const low = Math.max(36, ...near.map(n => n.pitch + (hand === 'left' ? -14 : 3)));
+    const high = Math.min(96, ...near.map(n => n.pitch + (hand === 'left' ? -3 : 14)));
+    const choices = [];
+    for (let pitch = low; pitch <= high; pitch++) {
+      if (segment.tones.includes(pc(pitch)) && near.every(n => ![1, 11].includes(pc(n.pitch - pitch)))) choices.push(pitch);
+    }
+    choices.sort((a, b) => Math.abs(a - (previous[hand]?.[0] ?? (low + high) / 2)) -
+      Math.abs(b - (previous[hand]?.[0] ?? (low + high) / 2)) || a - b);
+    return choices.length ? { hand, low, high, pitches: [choices[0]], shared: true } : null;
+  };
   for (const chord of harmony.segments) {
     if (!chord.tones.length) continue;
     const bounds = [chord.start, ...phrases.filter(p => p.start > chord.start && p.start < chord.end).map(p => p.start), chord.end];
+    const segments = [];
     for (let part = 0; part < bounds.length - 1; part++) {
       const segment = { ...chord, start: bounds[part], end: bounds[part + 1] };
-      const phrase = phraseAt(segment.start), hand = phrase.hand === 'right' ? 'left' : 'right';
-      const low = hand === 'right' ? Math.max(60, phrase.maxPitch + 3) : 40;
-      const pitches = hand === 'left' ? leftVoicing(segment, previous.left) : rightVoicing(segment, low, previous.right);
+      if (voiceSegment(segment).pitches.length) segments.push(segment);
+      else {
+        // One peak or changing non-chord tone must not silence a whole chord.
+        // Split only a span that has no safe held voice; common tones rejoin below.
+        const cuts = [segment.start, ...line.filter(n => n.startTimeSeconds >= segment.start + 0.12 &&
+          n.startTimeSeconds <= segment.end - 0.12).map(n => n.startTimeSeconds), segment.end];
+        for (let i = 0; i < cuts.length - 1; i++) segments.push({ ...segment, start: cuts[i], end: cuts[i + 1] });
+      }
+    }
+    for (let part = 0; part < segments.length; part++) {
+      const segment = segments[part];
+      let voicing = voiceSegment(segment);
+      if (!voicing.pitches.length) voicing = sharedTone(segment) ?? voicing;
+      const { hand, low, pitches, shared } = voicing;
       if (!pitches.length) continue;
-      previous[hand] = pitches;
+      if (!shared) previous[hand] = pitches;
       let weighted = 0, time = 0;
       for (const n of inst) {
         const overlap = Math.min(n.end, segment.end) - Math.max(n.startTimeSeconds, segment.start);
@@ -312,9 +387,7 @@ function accompaniment(inst, line, phrases, harmony, options) {
       }
       const amplitude = Math.min(1, (time ? weighted / time : 0.5) / p95);
       let root;
-      // Auto retains the optional shared-hand bass root; explicit hand controls
-      // reserve that entire hand for the melody.
-      if (hand === 'right' && part === 0 && options.melodyHand === 'auto') {
+      if (hand === 'right' && !shared && part === 0 && options.melodyHand === 'auto') {
         const sounding = line.filter(n => n.startTimeSeconds <= segment.start + 1e-9 && n.end > segment.start);
         const choices = Array.from({ length: 13 }, (_, k) => k + 40).filter(p => pc(p) === chord.root &&
           sounding.every(n => n.pitch - p >= 5 && n.pitch - p <= 12));
@@ -330,22 +403,25 @@ function accompaniment(inst, line, phrases, harmony, options) {
         }
       }
       let pulse = 0;
-      const events = attacksFor(segment, inst, harmony, options.chordsOnly ? Infinity : options.lhGroove).map(attack => ({
+      const events = (shared ? [{ t: segment.start, block: true }] :
+        attacksFor(segment, inst, harmony, options.chordsOnly ? Infinity : options.lhGroove)).map(attack => ({
         ...attack,
         pitches: attack.block ? root && attack.t === segment.start ? pitches.slice(-2) : pitches :
-          [pitches[hand === 'left' ? 1 + pulse++ % 2 : pulse++ % pitches.length]],
+          [pitches[hand === 'left' && pitches.length > 1
+            ? 1 + pulse++ % Math.max(1, pitches.length - 1) : pulse++ % pitches.length]],
       }));
       events.forEach((event, j) => {
         for (const pitch of event.pitches) {
           const next = events.slice(j + 1).find(e => e.pitches.includes(pitch));
-          const end = Math.min(next ? next.t - (harmony.grid ? harmony.beat / 4 : 0.06) : Infinity, segment.end);
+          const release = pitches.length === 1 ? 0.015 : harmony.grid ? harmony.beat / 4 : 0.06;
+          const end = Math.min(next ? next.t - release : Infinity, segment.end);
           if (end - event.t < 0.12) continue;
           const role = hand === 'left' && pitch === pitches[0] ? 'bass' : 'accompaniment';
           const a = amplitude * (event.block ? role === 'bass' ? 1 : 0.8 : 0.7);
           const note = { pitch, startTimeSeconds: event.t, end, amplitude: a, velocity: 0.3 + 0.3 * a,
             hand, role, chord: event.pitches.length > 1, onset: 1, chordTones: chord.tones,
-            registerLow: low, registerHigh: hand === 'right' ? 81 : role === 'bass' ? 52 : 59,
-            placement: hand === 'left' ? 'below' : 'above' };
+            registerLow: low, registerHigh: shared ? voicing.high : hand === 'right' ? 81 : role === 'bass' ? 52 : 59,
+            placement: shared ? hand === 'left' ? 'shared-below' : 'shared-above' : hand === 'left' ? 'below' : 'above' };
           const previousNote = lastByPitch.get(`${hand}:${pitch}`);
           if (j === 0 && previousNote && Math.abs(previousNote.end - event.t) < 1e-9 &&
             previousNote.placement === note.placement && previousNote.registerLow === low) {
@@ -373,9 +449,11 @@ export function filterClashes(notes) {
       const interval = Math.abs(pitch - m.pitch) % 12;
       if (interval === 1 || interval === 11 || pitch === m.pitch) return false;
       if (n.placement === 'below' && pitch > m.pitch - 2) return false;
-      if (n.placement === 'above' && pitch < Math.max(60, (m.phraseMaxPitch ?? m.pitch) + 3)) return false;
+      if (n.placement === 'above' && pitch < Math.max(60, m.pitch + 3)) return false;
       if ((n.placement === 'below' || n.placement === 'above') && n.hand === m.hand) return false;
       if (n.placement === 'root' && (m.pitch - pitch < 5 || m.pitch - pitch > 12)) return false;
+      if (n.placement === 'shared-below' && (n.hand !== m.hand || m.pitch - pitch < 3 || m.pitch - pitch > 14)) return false;
+      if (n.placement === 'shared-above' && (n.hand !== m.hand || pitch - m.pitch < 3 || pitch - m.pitch > 14)) return false;
       return n.hand !== m.hand || Math.abs(pitch - m.pitch) <= 14;
     });
     if (safe(n.pitch)) return true;
@@ -423,10 +501,10 @@ export function enforcePlayability(notes, bpm = 120) {
   for (const n of out) {
     for (let i = active.length - 1; i >= 0; i--) if (active[i].end <= n.startTimeSeconds + 1e-9) active.splice(i, 1);
     active.push(n);
-    const left = active.filter(n => n.hand === 'left');
-    const leftMelodyExcess = left.length > 2 && left.some(n => n.role === 'melody');
-    if (active.length > 4 || leftMelodyExcess) {
-      const drop = [...(leftMelodyExcess ? left : active)]
+    const melodyHandExcess = ['left', 'right'].map(hand => active.filter(n => n.hand === hand))
+      .find(notes => notes.length > 2 && notes.some(n => n.role === 'melody'));
+    if (active.length > 4 || melodyHandExcess) {
+      const drop = [...(melodyHandExcess ?? active)]
         .sort((a, b) => priority(a) - priority(b) || a.amplitude - b.amplitude)[0];
       drop.end = n.startTimeSeconds;
       active.splice(active.indexOf(drop), 1);
@@ -468,33 +546,77 @@ export function arrangeStems(melodyNotes, instrumentalNotes, options = {}) {
   if (!tempo.eligible && !options.tempo) tempo = estimateTempo([...attacks, ...vocal]);
   const last = Math.max(0, ...inst.map(n => n.end), ...vocal.map(n => n.end), options.durationSeconds ?? 0);
   const vocalTime = vocal.reduce((sum, n) => sum + duration(n), 0);
-  const noVocals = vocal.length < 15 || vocalTime < last * 0.08;
+  const covered = (notes, start, end) => {
+    let time = 0, cursor = start;
+    for (const n of notes) {
+      const a = Math.max(start, n.startTimeSeconds), b = Math.min(end, n.end);
+      if (b > a) { time += Math.max(0, b - Math.max(cursor, a)); cursor = Math.max(cursor, b); }
+    }
+    return time;
+  };
+  const instTop = trackMelody(groupBy30(inst.filter(n => n.pitch >= 55)));
+  const vocalCovered = covered(vocal, 0, last), instrumentalCovered = covered(instTop, 0, last);
+  // This is a sparse-coverage guard, not a singer classifier: repeated short
+  // leakage must not displace a much more continuous instrumental line.
+  const noVocals = vocal.length < 15 || vocalTime < last * 0.08 ||
+    vocalCovered < last * 0.2 && instrumentalCovered >= last * 0.35 && instrumentalCovered > 2 * vocalCovered;
   let line = noVocals ? [] : vocal.map(n => ({ ...n }));
-  const windows = [];
+  let windows = [];
   if (noVocals) windows.push([0, last]);
   else {
     let cursor = 0;
-    for (const n of [...line, { startTimeSeconds: last, end: last }]) {
-      if (n.startTimeSeconds - cursor >= 2) windows.push([cursor + 0.2, n.startTimeSeconds - 0.1]);
+    for (const [index, n] of [...line, { startTimeSeconds: last, end: last }].entries()) {
+      if (n.startTimeSeconds - cursor >= 2) windows.push([cursor + 0.2, n.startTimeSeconds - (index < line.length ? 0.1 : 0)]);
       cursor = Math.max(cursor, n.end);
     }
+    // A section can be mostly instrumental even if tiny leakage notes prevent
+    // a single two-second rest. Require a supported instrumental line as well.
+    for (let start = 0; start < last; start += 4) {
+      const end = Math.min(last, start + 4);
+      if (end - start >= 2 && covered(vocal, start, end) < (end - start) * 0.25 &&
+        covered(instTop, start, end) >= (end - start) * 0.35) windows.push([start, end]);
+    }
   }
-  const ampMedian = median(inst.map(n => n.amplitude));
+  windows.sort((a, b) => a[0] - b[0]);
+  windows = windows.reduce((out, range) => {
+    if (range[1] <= range[0]) return out;
+    if (out.length && range[0] <= out.at(-1)[1]) out.at(-1)[1] = Math.max(out.at(-1)[1], range[1]);
+    else out.push([...range]);
+    return out;
+  }, []);
+  line = line.filter(n => !windows.some(([start, end]) => n.startTimeSeconds >= start && n.startTimeSeconds < end));
+  // The original mix is available to callers without decoding again. Request
+  // its Classic extraction only when it is needed: separation may have taken
+  // the lead instrument out of the residual along with the vocals.
+  const needsFallback = windows.length > 0 && options.fallbackNotes === undefined;
+  const fallbackNotes = options.fallbackNotes ?? rawInst;
+  const classic = windows.length ? toPianoNotes(fallbackNotes, { ...options, preset: 'cover', quantize: false,
+    maxSounding: 4, maxPoly: pianoDefaults.maxPoly, splitAt: pianoDefaults.splitAt,
+    melody: pianoDefaults.melody, wobble: pianoDefaults.wobble, dynamics: pianoDefaults.dynamics,
+    minSounding: pianoDefaults.minSounding, legatoGap: pianoDefaults.legatoGap }) : [];
+  const classicLine = internal(classic.filter(n => n.hand === 'right' ||
+    !classic.some(other => other.hand === 'right' && other.startTimeSeconds <= n.startTimeSeconds &&
+      endOf(other) > n.startTimeSeconds)));
+  if (noVocals && options.fallbackNotes !== undefined && !options.tempo) {
+    tempo = estimateTempo(cleanNotes(fallbackNotes, options));
+  }
   for (const [start, end] of windows) {
-    const candidates = inst.filter(n => n.pitch >= 55 && n.amplitude >= 0.5 * ampMedian &&
-      n.startTimeSeconds >= start && n.startTimeSeconds < end && Math.min(n.end, end) - n.startTimeSeconds >= 0.2);
-    line.push(...trackMelody(groupBy30(candidates)).map(n => ({ ...n, end: Math.min(n.end, end), source: 'instrumental' })));
+    const candidates = classicLine.filter(n => n.end > start && n.startTimeSeconds < end);
+    line.push(...trackMelody(groupBy30(candidates)).map(n => ({ ...n,
+      startTimeSeconds: Math.max(n.startTimeSeconds, start), end: Math.min(n.end, end), source: 'instrumental' })));
   }
   line = line.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds).reduce((out, n) => {
     const previous = out.at(-1);
-    if (previous && n.startTimeSeconds - previous.startTimeSeconds < 0.16) {
+    const spacing = n.source === 'instrumental' || previous?.source === 'instrumental' ? 0.03 : 0.16;
+    if (previous && n.startTimeSeconds - previous.startTimeSeconds < spacing) {
       if (duration(n) * n.amplitude > duration(previous) * previous.amplitude) out[out.length - 1] = n;
     } else out.push(n);
     return out;
   }, []);
   for (let i = 0; i < line.length; i++) {
-    const next = line[i + 1], cap = next ? next.startTimeSeconds - 0.015 : Infinity;
-    if (next && next.startTimeSeconds - line[i].end <= options.rhLegato / 1000) line[i].end = cap;
+    const next = line[i + 1], fallback = line[i].source === 'instrumental';
+    const cap = next ? next.startTimeSeconds - (fallback ? 0.001 : 0.015) : Infinity;
+    if (!fallback && next && next.startTimeSeconds - line[i].end <= options.rhLegato / 1000) line[i].end = cap;
     else line[i].end = Math.min(line[i].end, cap);
     line[i].velocity = 0.55 + 0.4 * Math.max(0, Math.min(1, line[i].amplitude));
   }
@@ -503,14 +625,26 @@ export function arrangeStems(melodyNotes, instrumentalNotes, options = {}) {
   const backing = accompaniment(inst, assigned.notes, assigned.phrases, harmony, options);
   const before = filterClashes([...assigned.notes, ...backing]);
   const final = finalizeNotes(before, tempo, { ...options, preset: 'full', maxSounding: 4, minSounding: 100,
-    dynamics: false, splitPoint: 60, legatoGap: 0, melodyMinMs: 120, melodyMinIoiMs: 160 });
+    dynamics: false, splitPoint: 60, legatoGap: 0, melodyMinMs: noVocals ? 0 : 120, melodyMinIoiMs: noVocals ? 0 : 160 });
   const result = enforcePlayability(filterClashes(final), final.estimatedBpm);
   const melody = result.filter(n => n.role === 'melody'), melodyTime = melody.reduce((sum, n) => sum + duration(n), 0);
   for (const key of Object.keys(final)) if (!/^\d+$/.test(key)) result[key] = final[key];
-  result.vocalMedianPitch = weightedMedianPitch(vocal.map(n => ({ ...n, pitch: fold(n.pitch) })));
+  result.vocalMedianPitch = noVocals ? null : weightedMedianPitch(vocal.map(n => ({ ...n, pitch: fold(n.pitch) })));
+  result.vocalDecisionMedianPitch = assigned.vocalDecisionMedianPitch;
+  const leftShare = source => {
+    const notes = melody.filter(n => n.source === source), time = notes.reduce((sum, n) => sum + duration(n), 0);
+    return time ? notes.filter(n => n.hand === 'left').reduce((sum, n) => sum + duration(n), 0) / time : null;
+  };
+  result.vocalMelodyLeftShare = leftShare('vocal');
+  result.fallbackMelodyLeftShare = leftShare('instrumental');
   result.melodyMedianPitch = weightedMedianPitch(melody);
   result.melodyLeftShare = melodyTime ? melody.filter(n => n.hand === 'left').reduce((sum, n) => sum + duration(n), 0) / melodyTime : 0;
   result.noVocals = noVocals;
+  result.needsFallback = needsFallback;
+  result.fallbackWindows = windows;
+  result.fallbackUsed = options.fallbackNotes !== undefined && melody.some(n =>
+    assigned.notes.some(m => m.source === 'instrumental' && m.pitch === n.pitch &&
+      m.startTimeSeconds < n.end && m.end > n.startTimeSeconds));
   result.phrases = assigned.phrases.map(({ notes, ...phrase }) => phrase);
   result.chords = harmony.segments.map(({ bassWeights, ...segment }) => segment);
   for (const n of result) {

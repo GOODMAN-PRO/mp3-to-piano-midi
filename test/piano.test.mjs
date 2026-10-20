@@ -977,6 +977,8 @@ assert.equal(validMidiNotes[0].ticks, 3600 * 960);
 assert.deepEqual(noteStats([]), {
   notes: 0, seconds: 0, notesPerSec: 0, medianDurationMs: 0, pctUnder100ms: 0,
   pctUnder120ms: 0, melodyNotesPerSec: 0, melodyLeftShare: 0, vocalMedianPitch: null, melodyMedianPitch: null,
+  vocalDecisionMedianPitch: null, vocalMelodyLeftShare: null, fallbackMelodyLeftShare: null,
+  noBackingPct: null, longestNoBackingSeconds: null,
   melodyMetricSource: 'highest-right-hand-estimate', accompanimentAttacksPerSec: 0, clashPct: 0,
   perHand: {
     left: { accompanimentAttacksPerSec: 0, maxAccompanimentAttacksIn1s: 0, meanSounding: 0, maxSounding: 0 },
@@ -1199,12 +1201,15 @@ async function browserRun(preset, { empty = false, fail = false, quantize, fixtu
   };
   element('#file').files = [{ name: 'song.mp3', arrayBuffer: async () => new ArrayBuffer(0) }];
   let extractionOptions, pianoOptions, output, midiBytes, midiOptions, downloadBlob, separationOptions;
+  const extractionHistory = [];
   const modelState = { loads: 0, disposed: 0, scopes: 0, decodes: 0 };
   const workers = [];
   const runExtraction = (f, o, options) => {
     extractionOptions = options;
+    extractionHistory.push(options);
     if (fail) throw new Error('extract failed');
-    return fixture?.notes ?? extractNotes(f, o, options);
+    return (options.melodiaTrick && preset === 'stems' ? fixture?.fallbackNotes : undefined) ??
+      fixture?.notes ?? extractNotes(f, o, options);
   };
   const audioLength = 32;
   const fakeSeparation = { melody: fixture?.melody ?? [], inst22k: new Float32Array(audioLength / 2), timings: {} };
@@ -1220,7 +1225,9 @@ async function browserRun(preset, { empty = false, fail = false, quantize, fixtu
         const emit = data => (this.onmessage ?? this.listeners.message)?.({ data });
         try {
           if (this.url.includes('extract.worker')) {
-            if (cancelStage === 'extract') { element('#cancel').listeners.click(); return; }
+            if (cancelStage === 'extract' || cancelStage === 'fallbackExtract' && modelState.loads === 2) {
+              element('#cancel').listeners.click(); return;
+            }
             emit({ type: 'done', notes: runExtraction(message.frames, message.onsets, message.options) });
           } else {
             separationOptions = message.melodyOptions;
@@ -1248,7 +1255,9 @@ async function browserRun(preset, { empty = false, fail = false, quantize, fixtu
         sampleRate: this.sampleRate, getChannelData: () => new Float32Array(audioLength) }; } async close() {} },
     BasicPitch: class { constructor(model = Promise.resolve()) { this.model = Promise.resolve(model); }
       async evaluateModel(_, complete, progress) {
-      if (cancelStage === 'basicPitch') element('#cancel').listeners.click();
+      if (cancelStage === 'basicPitch' || cancelStage === 'fallbackBasicPitch' && modelState.loads === 2) {
+        element('#cancel').listeners.click();
+      }
       complete(empty ? [] : fixture?.frames ?? frames, empty ? [] : fixture?.onsets ?? strongOnsets); progress(1);
     } },
     tf: { engine: () => ({ startScope() { modelState.scopes++; }, endScope() { modelState.scopes--; } }), getBackend: () => 'cpu',
@@ -1280,7 +1289,7 @@ async function browserRun(preset, { empty = false, fail = false, quantize, fixtu
   assert.equal(element('#convert').disabled, false);
   if (downloadBlob) midiBytes = new Uint8Array(await downloadBlob.arrayBuffer());
   return { element, extractionOptions, pianoOptions, output, midiBytes, midiOptions, separationOptions,
-    fakeSeparation, workers, modelState };
+    fakeSeparation, workers, modelState, extractionHistory };
 }
 const cliExtraction = {
   onsetThresh: defaults.onset, frameThresh: defaults.frame, minMs: defaults.min, energyTolerance: defaults.tolerance,
@@ -1406,25 +1415,36 @@ for (const controls of [
   }
   assert.equal(Object.hasOwn(browser.separationOptions, 'minMs'), false,
     'Basic Pitch minimum note length must not override the vocal tracker minimum');
-  assert.deepEqual({ ...browser.extractionOptions }, { ...pianoDefaults, ...cliExtraction, melodiaTrick: false });
-  const cli = arrangeStems(fakeVocal, richSong, {
+  assert.deepEqual({ ...browser.extractionHistory[0] }, { ...pianoDefaults, ...cliExtraction, melodiaTrick: false });
+  const cliOptions = {
     ...cliPiano, ...expectedOptions, durationSeconds: browser.pianoOptions.durationSeconds,
-  });
+  };
+  let cli = arrangeStems(fakeVocal, richSong, cliOptions);
+  const needsFallback = cli.needsFallback;
+  if (needsFallback) {
+    assert.equal(browser.extractionHistory[1].melodiaTrick, true);
+    cli = arrangeStems(fakeVocal, richSong, { ...cliOptions, fallbackNotes: richSong });
+  }
   assert.deepEqual(browser.output, cli, 'Browser / CLI stems defaults or controls differ');
   assert.deepEqual(browser.midiBytes, notesToMidi(cli), 'Browser / CLI stems MIDI differs');
   assert.equal(browser.midiOptions.splitHands, true, 'Stems always exports the explicit hands');
   assert.ok(browser.workers.every(worker => worker.terminated));
-  assert.equal(browser.modelState.loads, 1);
-  assert.equal(browser.modelState.disposed, 1);
+  assert.equal(browser.modelState.loads, needsFallback ? 2 : 1);
+  assert.equal(browser.modelState.disposed, browser.modelState.loads);
   assert.equal(browser.modelState.scopes, 0);
   assert.match(browser.element('#summary').textContent,
     /^\d+ notes · melody from vocals \(L \d+% \/ R \d+%\) · backing from instrumental · done in \d+ s$/);
 }
 const extractedStems = await browserRun('stems', { fixture: { ...browserClicks, melody: fakeVocal } });
 const cliStemsExtraction = extractNotes(clickFrames, clickOnsets, { ...cliExtraction, melodiaTrick: false });
-assert.deepEqual(extractedStems.output, arrangeStems(fakeVocal, cliStemsExtraction, {
+const cliStemsOptions = {
   ...cliPiano, ...stemsDefaults, durationSeconds: extractedStems.pianoOptions.durationSeconds,
-}), 'The browser must use the same instrumental extraction settings as the CLI');
+};
+let cliStems = arrangeStems(fakeVocal, cliStemsExtraction, cliStemsOptions);
+if (cliStems.needsFallback) cliStems = arrangeStems(fakeVocal, cliStemsExtraction, {
+  ...cliStemsOptions, fallbackNotes: extractNotes(clickFrames, clickOnsets, { ...cliExtraction, melodiaTrick: true }),
+});
+assert.deepEqual(extractedStems.output, cliStems, 'The browser must use the same instrumental extraction settings as the CLI');
 const defaultStems = await browserRun(undefined, { fixture: stemsFixture });
 assert.equal(defaultStems.element('#preset').value, 'stems');
 assert.equal(defaultStems.element('#max-poly').disabled, true);
@@ -1445,9 +1465,14 @@ assert.match(fallback.element('#conversion-notice').textContent,
 assert.ok(fallback.workers.every(worker => worker.terminated));
 const noVocals = await browserRun('stems', { fixture: { notes: richSong, melody: [] } });
 assert.equal(noVocals.output.noVocals, true);
+assert.equal(noVocals.output.vocalMedianPitch, null);
+assert.equal(noVocals.modelState.decodes, 1, 'The fallback pass must reuse the retained decoded mix');
+assert.equal(noVocals.modelState.loads, 2);
+assert.equal(noVocals.extractionHistory[0].melodiaTrick, false);
+assert.equal(noVocals.extractionHistory[1].melodiaTrick, true);
 assert.match(noVocals.element('#conversion-notice').textContent,
   /No singing detected: using the instrumental's top line for the melody\./);
-for (const cancelStage of ['separating', 'basicPitch', 'extract']) {
+for (const cancelStage of ['separating', 'basicPitch', 'extract', 'fallbackBasicPitch', 'fallbackExtract']) {
   const cancelled = await browserRun('stems', { fixture: stemsFixture, cancelStage });
   assert.equal(cancelled.output, undefined);
   assert.equal(cancelled.element('#download').hidden, true);

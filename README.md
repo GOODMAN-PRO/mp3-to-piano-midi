@@ -31,28 +31,28 @@ The browser exposes arrangement, melody hand/octave, backing, sensitivity, thres
 | Control | What it does | Default |
 | --- | --- | --- |
 | Arrangement / `--classic --preset` | Vocal melody + backing separates the vocals. The mix-only group offers Full, Easy and Cover (Classic). Easy keeps melody plus the lowest bass; Full keeps transcription chords. | `stems` (Classic fallback: `cover`) |
-| Melody hand / `--melody-hand` | Auto uses the existing register rule. Left hand or Right hand forces the melody for the whole song and puts all backing in the opposite hand. | `auto` |
-| Melody octave / `--melody-octave` | Shifts the whole melody by −12, 0 or +12 semitones before hand assignment, folding only outside MIDI 36–96. | `0` |
+| Melody hand / `--melody-hand` (stems only) | Auto follows the vocal register independently of instrumental fallback phrases. Left hand or Right hand forces the melody for the whole song; backing normally uses the opposite hand. | `auto` |
+| Melody octave / `--melody-octave` (stems only) | Shifts the whole melody by −12, 0 or +12 semitones before hand assignment, folding only outside MIDI 36–96. | `0` |
 | Backing / `--chords-only` | Chords + pulses, or chords only. Applies to stems arrangements. | Chords + pulses |
 | Sensitivity / `--onset` | Onset threshold. Lower detects more attacks. | `0.5` |
 | Note threshold / `--frame` | Frame threshold. Lower retains quieter sustain. | `0.3` |
 | Min note length / `--min` | Minimum detection length, in milliseconds. | `80` |
-| Max notes per chord / `--poly` | Keeps the loudest playable notes per original 30 ms attack group. | `6` |
+| Max notes per chord / `--poly` (Classic only) | Keeps the loudest playable notes per original 30 ms attack group. | `6` |
 | Split hands / `--no-split` | Writes two piano tracks; disabling writes one without changing the arrangement. | On, automatic |
 | Snap to beat grid / `--no-quantize` | Estimates tempo and phase, snapping starts/ends to sixteenths with at least one sixteenth or 80 ms. Skips weak estimates and clips under 10 seconds. | On |
-| `--split-at` | Preferred hand boundary: `0` uses the median pitch clamped to MIDI 48–72; otherwise fixes the preferred pitch. | `0` |
+| `--split-at` (Classic only) | Preferred hand boundary: `0` uses the median pitch clamped to MIDI 48–72; otherwise fixes the preferred pitch. | `0` |
 | `--tolerance` | Consecutive low-energy model frames tolerated during sustain (one frame ≈11.6 ms). | `11` |
 | `--legato` | Joins same-pitch fragments across gaps ≤80 ms when the later onset is weaker than this threshold. | `0.7` |
 | `--harmonic` | Removes quieter +12/+19/+24 overtones with starts within 30 ms and ≥60% duration overlap; value is their amplitude ratio to the lower note. | `0.6` |
 | `--align` | Aligns attacks within this many milliseconds, preserving endings where possible (1 ms minimum) and same-pitch re-strikes. | `30` |
 | `--ghost` | Removes notes shorter than 150 ms below this fraction of the median amplitude within ±1 second. | `0.35` |
-| Dynamics / `--no-dynamics` | Maps amplitude percentiles 5–95 to velocities 0.35–0.95, clamped to 0.1–1; constant amplitudes use 0.7. | On |
-| `--min-sounding` | Extends isolated short notes to this length, in milliseconds, before the sounding cap. | `100` |
-| `--legato-gap` | Fills gaps between single-note attacks in one hand, adding at most 150 ms per note. Disabled by default to allow releases. | `0` |
-| `--max-sounding` | Releases older sustains when a chord starts; prefers the incoming hand, then oldest/quietest notes. Protects the first 60 ms of each attack. | Full `6`; Easy `5`; Cover `4` |
+| Dynamics / `--no-dynamics` (Classic only) | Maps amplitude percentiles 5–95 to velocities 0.35–0.95, clamped to 0.1–1; constant amplitudes use 0.7. | On |
+| `--min-sounding` (Classic only) | Extends isolated short notes to this length, in milliseconds, before the sounding cap. | `100` |
+| `--legato-gap` (Classic only) | Fills gaps between single-note attacks in one hand, adding at most 150 ms per note. Disabled by default to allow releases. | `0` |
+| `--max-sounding` (Classic only) | Releases older sustains when a chord starts; prefers the incoming hand, then oldest/quietest notes. Protects the first 60 ms of each attack. | Full `6`; Easy `5`; Cover `4` |
 | `--key-clean` | Removes out-of-key notes shorter than 200 ms and below this fraction of the local median amplitude within ±1 second. Keeps long or strong chromatic notes. | `0.6` |
-| `--wobble` | Joins alternating semitone runs of singleton hand attacks within this many milliseconds; keeps the pitch with more note-time. Chords and nearby re-strikes are protected. | `0` (off) |
-| `--melody` | Positive enables the melody tracker with rests in Easy/Cover; zero restores highest-note selection. The numeric flag is retained for compatibility. | `3` (on) |
+| `--wobble` (Classic only) | Joins alternating semitone runs of singleton hand attacks within this many milliseconds; keeps the pitch with more note-time. Chords and nearby re-strikes are protected. | `0` (off) |
+| `--melody` (Classic only) | Positive enables the melody tracker with rests in Easy/Cover; zero restores highest-note selection. The numeric flag is retained for compatibility. | `3` (on) |
 
 Sensitivity, Note threshold and Min note length control Basic Pitch on the instrumental in stems mode, with the Melodia continuation pass disabled. Max notes per chord and Split hands are hidden there because stems assigns hands explicitly.
 
@@ -64,7 +64,7 @@ A short note is isolated when no same-pitch note starts within 120 ms after its 
 
 ## Command line
 
-Requires **ffmpeg on PATH** and Node 24:
+Requires **ffmpeg and ffprobe on PATH** and Node 24:
 
 ```sh
 node cli.mjs "song.mp3" --out "song.mid" --json
@@ -76,11 +76,13 @@ Without `--out`, the MIDI is written beside the input. CPU inference can take se
 
 ### Vocal melody and instrumental backing (browser and CLI default)
 
-The melody comes from the separated vocals; accompaniment comes from the instrumental. By default vocal pitches stay at their real octave, folding only outside MIDI 36–96. Auto phrases use a duration-weighted median: 60 or higher goes right, 57 or lower goes left, and the middle range keeps the previous hand (first phrase: right at 59 or above). Phrases shorter than four seconds share a decision with a neighbouring phrase. Melody rests of at least one second, or two accepted beats, separate phrases. An explicit octave shift applies before this rule; forcing Left or Right overrides only the hand decision.
+The melody comes from the separated vocals; accompaniment comes from the instrumental. By default vocal pitches stay at their real octave, folding only outside MIDI 36–96. Auto decides vocal and instrumental fallback phrases separately. The duration-weighted median of the vocal notes actually used, V, seeds the vocal hand: right at V ≥59.5, otherwise left. Each vocal phrase then goes right at median ≥60, left at median ≤57, or keeps the previous vocal hand in between. Vocal phrases shorter than four seconds share a decision with a neighbouring vocal phrase. Instrumental fallback never changes this vocal hand state.
 
-The other hand plays sparse chord blocks and pulses below or above the melody. Close semitone clashes are revoiced or removed. Vocal gaps of at least two seconds can use an instrumental melody; songs with little detected singing use that fallback throughout. This is a generated arrangement and still needs a listening check.
+Each fallback phrase uses its own median: right at ≥60, otherwise left. A fallback phrase in the neutral 58–59 band inherits the hand of the vocal phrases on either side when both agree. Melody rests of at least one second, or two accepted beats, separate phrases; Auto also separates them at source changes. An explicit octave shift applies before the hand decisions; forcing Left or Right still fixes the hand for the whole melody and retains its original phrase grouping.
 
-Extreme hand/octave choices can leave no room for backing within the existing register and span limits. In that case backing notes are omitted while the requested melody is preserved.
+The other hand plays sparse chord blocks and pulses below or above the melody. Close semitone clashes are revoiced or removed. Vocal gaps of at least two seconds, supported sparse sections, and songs with little detected singing request a Classic melody from the original mix. This extra transcription is conditional and reuses its inference cache in the CLI; the browser retains the decoded mix. Instrumental backing still comes from the separated instrumental. This is a generated arrangement and still needs a listening check.
+
+Backing placement follows local melody attacks. If the opposite hand has no usable voicing, one sparse chord tone may share the melody hand within its 14-semitone span: 3–14 semitones below a high left-hand melody, or above a low right-hand melody. The same clash and span checks apply, and the requested melody hand stays fixed. If neither placement is playable, that backing attack is omitted.
 
 ```sh
 npm i --cache G:\Temp\npm-cache -O onnxruntime-node@1.30.0
@@ -91,11 +93,15 @@ node cli.mjs "Kiss of Death.mp3" --melody-hand left --melody-octave -1 --out "Ki
 
 The optional Node runtime is loaded only in stems mode. `--ep dml|cpu` chooses separation execution (DirectML on Windows by default, with CPU retry on failure; CPU elsewhere). `--keep-stems <dir>` writes float32 `vocals.wav` and `instrumental.wav`. `--classic` preserves the original Full/Easy/Cover pipeline and does not need ONNX Runtime.
 
-Stems tuning: `--theta 0.65` controls vocal detection, `--split-db 6` controls repeated-note energy dips (`99` disables almost all such splits), `--lh-groove 0.6` controls accompaniment pulses in either hand, `--chords-only` removes pulses, and `--rh-legato 350` sets melody gap filling in milliseconds in either hand. `--no-quantize` preserves timing. Classic preset, hand-split boundary and polyphony controls do not select the stems melody or its hand.
+Stems tuning: `--theta 0.65` controls vocal detection, `--split-db 6` controls repeated-note energy dips (`99` disables almost all such splits), `--lh-groove 0.6` controls accompaniment pulses in either hand, `--chords-only` removes pulses, and `--rh-legato 350` sets melody gap filling in milliseconds in either hand. `--no-quantize` preserves timing.
 
-Separation decodes at 44.1 kHz stereo without loudness normalisation. Mono is duplicated; for more than two channels, zero-based even channels are averaged into left and odd channels into right. Both stems use a delay-compensated 31-tap Hann-windowed half-band filter to produce 22.05 kHz mono. Instrumental Basic Pitch extraction skips the Melodia continuation pass. Tempo estimation uses detected attacks, so onset-less continuations cannot move the beat grid; chord estimation still uses all supplied notes. The shared separator uses a periodic Hann; the vocal tracker uses a symmetric Hann.
+CLI flags have explicit modes. In stems mode, `--preset`, `--poly`, `--max-sounding`, `--split-at`, `--melody`, `--min-sounding`, `--legato-gap`, `--wobble` and `--no-dynamics` are ignored; add `--classic` to use them. In Classic mode, `--keep-stems`, `--ep`, `--theta`, `--split-db`, `--lh-groove`, `--rh-legato`, `--chords-only`, `--melody-hand` and `--melody-octave` are ignored. Each explicitly supplied flag for the other mode produces its own warning on stderr. JSON `parameters` lists only settings applicable to the selected mode.
 
-The model is copied from the local research download when available, otherwise downloaded from the [official UVR release](https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_2.onnx), then checked against SHA-256 `ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b`. It stays in ignored `.cache/models/`. Stem inference caches end in `-stems.json` and retain default melody notes plus instrumental frames; a small vocal audio cache supports melody parameter sweeps. Changes to shared audio-processing code invalidate these caches.
+Detection controls (`--onset`, `--frame`, `--min`, `--tolerance`), cleanup (`--legato`, `--harmonic`, `--align`, `--ghost`, `--key-clean`), `--no-quantize` and the MIDI packaging option `--no-split` apply in both modes. In particular, alignment and key cleanup operate on instrumental notes before stems chord inference.
+
+Separation decodes at 44.1 kHz stereo without loudness normalisation. Mono is duplicated; for more than two channels, zero-based even channels are averaged into left and odd channels into right. CLI pan filters first convert to planar float, avoiding integer-PCM wraparound when downmixing surround audio. Both stems use a delay-compensated 31-tap Hann-windowed half-band filter to produce 22.05 kHz mono. Instrumental Basic Pitch extraction skips the Melodia continuation pass. Tempo estimation uses detected attacks, so onset-less continuations cannot move the beat grid; chord estimation still uses all supplied notes. The shared separator uses a periodic Hann; the vocal tracker uses a symmetric Hann.
+
+The model is copied from the local research download when available, otherwise downloaded from the [official UVR release](https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_2.onnx), then checked against SHA-256 `ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b`. It stays in ignored `.cache/models/`. Stem inference caches end in `-stems.json` and retain default melody notes plus instrumental frames; a small vocal audio cache supports melody parameter sweeps. Changes to shared audio-processing code invalidate these caches. Legacy stereo caches are checked once with ffprobe: surround integer-PCM caches are regenerated using the corrected float-domain decode, while safe mono, stereo and floating-point caches are upgraded without rerunning inference.
 
 Vocal separation: Kim_Vocal_2 (UVR MDX-Net) by Kimberley Jensen, via Ultimate Vocal Remover. UVR code is MIT; the model weights are not covered by this repository's licence and are downloaded at runtime, not redistributed.
 
@@ -105,7 +111,9 @@ Local verification reports and listening files are in ignored `.cache/`, includi
 
 `--json` writes statistics to stdout and progress to stderr. Statistics describe the final arrangement before MIDI tick rounding. Fragments count same-pitch gaps ≤50 ms, including real repeats; chord/hand metrics use anchored 30 ms groups. Sounding metrics cover first onset through last release. Key estimates use duration-weighted [Krumhansl–Schmuckler profiles](https://music21.org/music21docs/_modules/music21/analysis/discrete.html); out-of-key does not necessarily mean wrong. Wobble counts alternating singleton semitone triples ≤150 ms apart. Melody jump rate counts intervals >7 semitones; Classic follows the highest right-hand pitch per group. `estimatedBpm` is the exported tempo; `gridDeviationMs` measures pre-snap starts against the candidate grid (120 BPM grid after rejection). `tempoConfidence` and `phaseConfidence` report the two guards; `quantizedNotes` counts starts accepted for snapping, and `timingOffsetSeconds` records the common shift. Duration percentiles use ms; velocities use 0–1.
 
-Stems statistics use `role === 'melody'`, including instrumental fallback melody, irrespective of hand. `melodyLeftShare` is a fraction of melody note-time. Classic has no role labels: its melody metrics are explicitly marked `highest-right-hand-estimate` and cannot measure a true vocal melody or its left-hand share. `clashPct` is the union of simultaneous semitone-class clashes within 14 semitones divided by melody note-time. `pctUnder120ms` counts short notes; `perHand` reports accompaniment attacks/s, maximum accompaniment attack groups in any one-second window, mean sounding and maximum sounding. Means use the whole arrangement span, including internal rests.
+Stems statistics use `role === 'melody'`, including instrumental fallback melody, irrespective of hand. `melodyLeftShare` is a fraction of final melody note-time. `vocalMelodyLeftShare` and `fallbackMelodyLeftShare` measure that fraction within each source, or are `null` when that source is absent. `vocalMedianPitch` is the detected vocal median in its native register, or `null` when vocals were discarded. `vocalDecisionMedianPitch` is V: the duration-weighted median of the used vocal notes after octave shifting and range folding, before hand assignment. It is `null` without used vocals.
+
+`fallbackUsed` records surviving melody from the original mix, and `fallbackCacheHit` reports its separate inference-cache reuse when requested; `fallbackBasicPitch` and `fallbackExtraction` timings are reported separately. Classic has no role labels: its melody metrics are explicitly marked `highest-right-hand-estimate` and cannot measure a true vocal melody or its left-hand share; the vocal and source-specific fields above are `null`. `clashPct` is the union of simultaneous semitone-class clashes within 14 semitones divided by melody note-time. `noBackingPct` is the percentage of non-N chord time with no sounding accompaniment, including partial gaps within chord segments; `longestNoBackingSeconds` is the longest such gap. Chord timestamps are adjusted by the same timing offset as the notes. Both coverage metrics are `null` for Classic, which has no chord timeline. `pctUnder120ms` counts short notes; `perHand` reports accompaniment attacks/s, maximum accompaniment attack groups in any one-second window, mean sounding and maximum sounding. Means use the whole arrangement span, including internal rests.
 
 ## How the classic arrangement is built
 

@@ -6,8 +6,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node test/piano.test.mjs && node test/stats.test.mjs && node test/separate.test.mjs && node test/stems.test.mjs && node test/cli.test.mjs && node test/worker.test.mjs",
-    "test:golden": "node test/classic-golden.mjs && node test/separation-golden.mjs"
+    "test": "node test/piano.test.mjs && node test/stats.test.mjs && node test/separate.test.mjs && node test/stems.test.mjs && node test/no-vocals.test.mjs && node test/cli.test.mjs && node test/worker.test.mjs",
+    "test:golden": "node test/classic-golden.mjs && node test/separation-golden.mjs && node test/no-vocals-golden.mjs"
   },
   "keywords": [],
   "author": "",
