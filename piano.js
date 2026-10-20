@@ -217,7 +217,9 @@ export function estimateTempo(notes) {
   return { estimatedBpm: bpm, tempoConfidence: confidence, phaseConfidence: bestPhase, gridPhaseSeconds: phase, gridDeviationMs: deviation * 1000, eligible: true };
 }
 
-export function quantizeNotes(notes, timing, { preset = 'full', enabled = true } = {}) {
+export function quantizeNotes(notes, timing, {
+  preset = 'full', enabled = true, melodyMinMs = 0, melodyMinIoiMs = 0,
+} = {}) {
   const metadata = { ...timing, estimatedBpm: enabled && timing.eligible ? timing.estimatedBpm : 120,
     quantized: false, quantizedNotes: 0, timingOffsetSeconds: 0 };
   if (!enabled || !timing.eligible || !notes.length) return { ...metadata, notes: notes.map(note => ({ ...note })) };
@@ -232,6 +234,9 @@ export function quantizeNotes(notes, timing, { preset = 'full', enabled = true }
   });
   const protectedNotes = new Set();
   const byStart = original.map((_, i) => i).sort((a, b) => original[a].startTimeSeconds - original[b].startTimeSeconds);
+  const melodyOrder = byStart.filter(index => original[index].role === 'melody');
+  const melodyMinimum = melodyMinMs / 1000, melodyIoi = melodyMinIoiMs / 1000;
+  const tick = 60 / (timing.estimatedBpm * 480);
   const rank = new Map(byStart.map((index, position) => [index, position]));
   const protectOne = index => {
     if (protectedNotes.has(index)) return false;
@@ -295,18 +300,41 @@ export function quantizeNotes(notes, timing, { preset = 'full', enabled = true }
       }
       i = end;
     }
+    // Stems keep the tracker's note lengths and spacing, including the later
+    // one-tick release before the next melody note. Revert whole attack groups.
+    if (melodyMinimum > 0 || melodyIoi > 0) for (let at = 0; at < melodyOrder.length; at++) {
+      const index = melodyOrder[at], next = melodyOrder[at + 1];
+      const availableEnd = next === undefined ? result[index].end
+        : Math.min(result[index].end, result[next].startTimeSeconds - tick);
+      if (melodyMinimum > 0 && original[index].end - original[index].startTimeSeconds >= melodyMinimum - 1e-9 &&
+        availableEnd - result[index].startTimeSeconds < melodyMinimum - 1e-9) {
+        if (next !== undefined && result[next].startTimeSeconds - tick < result[index].end) {
+          changed = protect(next) || changed;
+        }
+        changed = protect(index) || changed;
+      }
+      if (next !== undefined && melodyIoi > 0 &&
+        result[next].startTimeSeconds - result[index].startTimeSeconds < melodyIoi - 1e-9) {
+        changed = protect(index) || changed;
+        changed = protect(next) || changed;
+      }
+    }
   } while (changed);
   return { ...metadata, notes: result.sort((a, b) => a.startTimeSeconds - b.startTimeSeconds),
     quantized: true, quantizedNotes: result.length - protectedNotes.size, timingOffsetSeconds: offset };
 }
 
-export function toPianoNotes(notes, options = {}) {
+const percentile = (values, p) => {
+  if (!values.length) return 0;
+  const index = (values.length - 1) * p, lo = Math.floor(index), hi = Math.ceil(index);
+  return values[lo] + (values[hi] - values[lo]) * (index - lo);
+};
+
+// Keep the original attack anchors for Classic while exposing the cleaned notes to stems.
+export function cleanNotes(notes, options = {}) {
   const settings = { ...pianoDefaults };
   for (const [key, value] of Object.entries(options)) if (value !== undefined) settings[key] = value;
-  const {
-    maxPoly, legato, harmonic, align, dynamics, ghost, splitAt, preset, minSounding, legatoGap,
-    maxSounding = defaultMaxSounding(preset), keyClean, wobble, melody, quantize,
-  } = settings;
+  const { legato, harmonic, align, ghost, keyClean } = settings;
   const sorted = notes.filter(note => note && Number.isFinite(note.pitchMidi) &&
     Number.isFinite(note.startTimeSeconds) && note.startTimeSeconds >= 0 &&
     Number.isFinite(note.durationSeconds) && note.durationSeconds > 0 &&
@@ -370,11 +398,6 @@ export function toPianoNotes(notes, options = {}) {
     i = end;
   }
 
-  const percentile = (values, p) => {
-    if (!values.length) return 0;
-    const index = (values.length - 1) * p, lo = Math.floor(index), hi = Math.ceil(index);
-    return values[lo] + (values[hi] - values[lo]) * (index - lo);
-  };
   const selected = chords.flat();
   const quiet = new Set();
   const key = keyClean > 0 ? estimateKey(selected) : null;
@@ -420,7 +443,14 @@ export function toPianoNotes(notes, options = {}) {
       i = end;
     }
   }
+  return Object.defineProperty(aligned, 'chords', { value: chords });
+}
 
+export function toPianoNotes(notes, options = {}) {
+  const settings = { ...pianoDefaults };
+  for (const [key, value] of Object.entries(options)) if (value !== undefined) settings[key] = value;
+  const { maxPoly, splitAt, preset, wobble, melody } = settings;
+  const aligned = cleanNotes(notes, settings), chords = aligned.chords;
   const pitches = aligned.map(note => note.pitch).sort((a, b) => a - b);
   const splitPoint = splitAt || Math.min(72, Math.max(48, pitches.length ? percentile(pitches, 0.5) : 60));
   const violations = hand => Number(hand.length > 5) +
@@ -598,7 +628,16 @@ export function toPianoNotes(notes, options = {}) {
     }
     kept = kept.filter(note => note.hand === 'right' || selectedLeft.has(note));
   }
+  return finalizeNotes(kept, tempo, { ...settings, splitPoint, playabilityDrops });
+}
 
+// Input uses pitch/startTimeSeconds/end and already-assigned hands. Copy before timing edits.
+export function finalizeNotes(notes, tempo = estimateTempo(notes), options = {}) {
+  const settings = { ...pianoDefaults };
+  for (const [key, value] of Object.entries(options)) if (value !== undefined) settings[key] = value;
+  const { dynamics, preset, minSounding, legatoGap, quantize, maxSounding = defaultMaxSounding(preset),
+    splitPoint = 60, playabilityDrops = 0, melodyMinMs = 0, melodyMinIoiMs = 0 } = settings;
+  let kept = notes.map(note => ({ ...note })).sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
   const nextByPitch = new Map(), nextByHand = new Map();
   for (let i = kept.length - 1; i >= 0; i--) {
     const note = kept[i], originalEnd = note.end;
@@ -645,7 +684,7 @@ export function toPianoNotes(notes, options = {}) {
     }
   };
   releaseSustains();
-  const timing = quantizeNotes(kept, tempo, { preset, enabled: quantize });
+  const timing = quantizeNotes(kept, tempo, { preset, enabled: quantize, melodyMinMs, melodyMinIoiMs });
   kept = timing.notes;
   delete timing.notes;
   releaseSustains();
@@ -658,10 +697,16 @@ export function toPianoNotes(notes, options = {}) {
     startTimeSeconds: note.startTimeSeconds,
     durationSeconds: note.end - note.startTimeSeconds,
     amplitude: note.amplitude,
-    velocity: dynamics
+    velocity: Number.isFinite(note.velocity) ? Math.min(1, Math.max(0.05, note.velocity)) : dynamics
       ? p95 > p5 ? Math.min(1, Math.max(0.1, 0.35 + 0.6 * (note.amplitude - p5) / (p95 - p5))) : 0.7
       : Math.min(1, Math.max(0.05, note.amplitude)),
     ...(note.onset === undefined ? {} : { onset: note.onset }),
+    ...(note.role === undefined ? {} : { role: note.role }),
+    ...(note.chordTones === undefined ? {} : { chordTones: note.chordTones }),
+    ...(note.registerLow === undefined ? {} : { registerLow: note.registerLow }),
+    ...(note.registerHigh === undefined ? {} : { registerHigh: note.registerHigh }),
+    ...(note.placement === undefined ? {} : { placement: note.placement }),
+    ...(note.phraseMaxPitch === undefined ? {} : { phraseMaxPitch: note.phraseMaxPitch }),
   }));
   return Object.assign(result, { splitPoint, playabilityDrops, ...timing });
 }

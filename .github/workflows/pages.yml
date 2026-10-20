@@ -22,7 +22,37 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - run: npm ci --omit=optional
+      - name: Restore Vite's existing Linux native bindings
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          import { join } from 'node:path';
+          import { tmpdir } from 'node:os';
+          const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'));
+          const temporary = mkdtempSync(join(tmpdir(), 'vite-native-'));
+          try {
+            for (const name of ['@rolldown/binding-linux-x64-gnu', 'lightningcss-linux-x64-gnu']) {
+              const entry = lock.packages[`node_modules/${name}`];
+              const response = await fetch(entry.resolved);
+              if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+              const bytes = Buffer.from(await response.arrayBuffer());
+              const [algorithm, expected] = entry.integrity.split('-');
+              if (createHash(algorithm).update(bytes).digest('base64') !== expected) {
+                throw new Error(`${name}: package-lock integrity mismatch`);
+              }
+              const archive = join(temporary, 'binding.tgz'), destination = join('node_modules', name);
+              writeFileSync(archive, bytes);
+              mkdirSync(destination, { recursive: true });
+              execFileSync('tar', ['-xzf', archive, '--strip-components=1', '-C', destination]);
+              console.log(`Restored ${name}@${entry.version}`);
+            }
+          } finally {
+            rmSync(temporary, { recursive: true, force: true });
+          }
+          NODE
       - run: npm test
       - run: npm run build
       - uses: actions/configure-pages@v5

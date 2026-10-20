@@ -4,6 +4,7 @@ import { pianoDefaults } from './piano.js';
 export function extractNotes(frames, onsets, {
   onsetThresh = pianoDefaults.onsetThresh, frameThresh = pianoDefaults.frameThresh,
   minMs = pianoDefaults.minMs, energyTolerance = pianoDefaults.energyTolerance,
+  melodiaTrick = true,
 } = {}) {
   if (!frames.length) return [];
   // Missing onset data still has usable frame energy for Melodia continuations.
@@ -16,8 +17,9 @@ export function extractNotes(frames, onsets, {
   const minNoteLen = Math.max(0, Math.ceil(minMs / 11.6099) - 1);
   const args = [frames, onsets, onsetThresh, frameThresh, minNoteLen, true, null, null];
   // Melodia notes are appended after onset notes. Count the latter to identify continuations exactly.
-  const onsetCount = outputToNotesPoly(...args, false, energyTolerance).length;
-  const noteFrames = outputToNotesPoly(...args, true, energyTolerance);
+  const onsetFrames = outputToNotesPoly(...args, false, energyTolerance);
+  const onsetCount = onsetFrames.length;
+  const noteFrames = melodiaTrick ? outputToNotesPoly(...args, true, energyTolerance) : onsetFrames;
   return noteFramesToTime(noteFrames).map((note, index) => ({
     pitchMidi: note.pitchMidi,
     startTimeSeconds: note.startTimeSeconds,

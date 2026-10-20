@@ -698,6 +698,30 @@ for (const repeated of [
 // Quantization must not combine two playable attacks into an unreachable chord.
 const wideGrid = quantizeNotes([internalNote(60, 0.02, 0.2), internalNote(84, 0.07, 0.25)], gridWithoutPhase);
 assert.equal(noteStats(fromInternal(wideGrid.notes)).handSpanViolations, 0);
+const vocalGrid = { ...gridWithoutPhase, estimatedBpm: 126 };
+const vocalAttacks = Array.from({ length: 12 }, (_, i) => ({
+  ...internalNote(52 + i % 3, 0.01 + i * 0.18, 0.15 + i * 0.18, 'left'), role: 'melody',
+}));
+const vocalOriginal = structuredClone(vocalAttacks);
+const unsafeVocalGrid = quantizeNotes(vocalAttacks, vocalGrid);
+assert.ok(unsafeVocalGrid.notes.some(n => n.end - n.startTimeSeconds < 0.12),
+  'This fixture must expose the sub-120 ms sixteenth');
+const safeVocalGrid = quantizeNotes(vocalAttacks, vocalGrid, { melodyMinMs: 120, melodyMinIoiMs: 160 });
+const midiTick = 60 / (126 * 480);
+for (let i = 0; i < safeVocalGrid.notes.length; i++) {
+  const n = safeVocalGrid.notes[i], next = safeVocalGrid.notes[i + 1];
+  const end = next ? Math.min(n.end, next.startTimeSeconds - midiTick) : n.end;
+  assert.ok(end - n.startTimeSeconds >= 0.12 - 1e-9);
+  if (next) assert.ok(next.startTimeSeconds - n.startTimeSeconds >= 0.16 - 1e-9);
+}
+assert.deepEqual(vocalAttacks, vocalOriginal);
+// Melody protection must also retain a simultaneous accompaniment attack.
+const vocalChord = [
+  { ...internalNote(52, 0.01, 0.15, 'left'), role: 'melody' },
+  { ...internalNote(72, 0.01, 0.4), role: 'accompaniment' },
+];
+const protectedVocalChord = quantizeNotes(vocalChord, vocalGrid, { melodyMinMs: 120 });
+assert.deepEqual(protectedVocalChord.notes.map(n => n.startTimeSeconds), [0.01, 0.01]);
 for (const preset of ['easy', 'cover']) {
   const lineGrid = quantizeNotes([internalNote(60, 0.02, 0.2), internalNote(64, 0.07, 0.25)],
     gridWithoutPhase, { preset });
@@ -950,6 +974,12 @@ assert.equal(validMidiNotes[0].ticks, 3600 * 960);
 
 assert.deepEqual(noteStats([]), {
   notes: 0, seconds: 0, notesPerSec: 0, medianDurationMs: 0, pctUnder100ms: 0,
+  pctUnder120ms: 0, melodyNotesPerSec: 0, melodyLeftShare: 0, vocalMedianPitch: null,
+  melodyMetricSource: 'highest-right-hand-estimate', accompanimentAttacksPerSec: 0, clashPct: 0,
+  perHand: {
+    left: { accompanimentAttacksPerSec: 0, maxAccompanimentAttacksIn1s: 0, meanSounding: 0, maxSounding: 0 },
+    right: { accompanimentAttacksPerSec: 0, maxAccompanimentAttacksIn1s: 0, meanSounding: 0, maxSounding: 0 },
+  },
   durationP10: 0, durationP50: 0, durationP90: 0, maxDurationMs: 0,
   isolatedShortNotes: 0, sameHandGapsUnder100ms: 0,
   fragments: 0, meanOnsetAtFragmentStart: 0, maxSoundingAtOnce: 0,
@@ -1131,7 +1161,7 @@ try {
   childProcess.spawnSync = () => ({ error: Object.assign(new Error('buffer exceeded'), { code: 'ENOBUFS' }) });
   syncBuiltinESMExports();
   console.error = message => decodeErrors.push(message);
-  process.argv = [process.execPath, fileURLToPath(new URL('../cli.mjs', import.meta.url)), fileURLToPath(import.meta.url)];
+  process.argv = [process.execPath, fileURLToPath(new URL('../cli.mjs', import.meta.url)), fileURLToPath(import.meta.url), '--classic'];
   await import('../cli.mjs?decode-limit-test');
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(process.exitCode, 1);

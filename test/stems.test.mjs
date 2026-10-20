@@ -1,0 +1,173 @@
+import assert from 'node:assert/strict';
+import { arrangeStems, assignMelodyHands, enforcePlayability, filterClashes, groupBy30, inferChords, weightedMedianPitch } from '../stems.js';
+import { noteStats } from '../cli.mjs';
+import { notesToMidi } from '../midi.js';
+import midiPackage from '@tonejs/midi';
+
+const note = (pitch, start, length, amplitude = 0.8) => ({
+  pitch, startTimeSeconds: start, durationSeconds: length, end: start + length, amplitude,
+});
+const phrase = (pitch, start, length = 5) => Array.from({ length: Math.ceil(length / 0.5) },
+  (_, i) => note(pitch, start + i * 0.5, Math.min(0.45, length - i * 0.5)));
+const noGrid = { eligible: false, estimatedBpm: 120, gridPhaseSeconds: 0,
+  tempoConfidence: 0, phaseConfidence: 0, gridDeviationMs: 0 };
+const grid = { ...noGrid, eligible: true, tempoConfidence: 1, phaseConfidence: 1 };
+
+assert.equal(weightedMedianPitch([note(48, 0, 3), note(72, 4, 1), note(72, 6, 1)]), 48);
+assert.equal(weightedMedianPitch([]), null);
+let assignment = assignMelodyHands([...phrase(52, 0), ...phrase(72, 7)], noGrid);
+assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'right']);
+assert.ok(assignment.notes.slice(0, 10).every(n => n.pitch === 52));
+assignment = assignMelodyHands([...phrase(52, 0), ...phrase(58, 7), ...phrase(72, 14), ...phrase(58, 21)], noGrid);
+assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'left', 'right', 'right']);
+assert.equal(assignMelodyHands(phrase(59, 0)).phrases[0].hand, 'right');
+assert.equal(assignMelodyHands(phrase(58, 0)).phrases[0].hand, 'left');
+assignment = assignMelodyHands([...phrase(52, 0), ...phrase(72, 6.5, 1), ...phrase(52, 9)], noGrid);
+assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'left', 'left'], 'A short high phrase cannot flip the hand');
+assignment = assignMelodyHands([...phrase(72, 0, 1), ...phrase(52, 2.5)], noGrid);
+assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'left'], 'An initial short phrase shares its next neighbour');
+assignment = assignMelodyHands([...phrase(52, 0, 2), ...phrase(53, 4, 2), ...phrase(72, 8, 2), ...phrase(74, 12, 2)]);
+assert.deepEqual(assignment.phrases.map(p => p.hand), ['left', 'left', 'right', 'right'],
+  'Neighbouring short phrases can jointly establish a later register change');
+assert.equal(assignMelodyHands([note(30, 0, 1), note(100, 2, 1)]).notes[0].pitch, 42);
+assert.equal(assignMelodyHands([note(30, 0, 1), note(100, 2, 1)]).notes[1].pitch, 88);
+assert.ok(assignMelodyHands([note(1e100, 0, 1)]).notes.every(n => n.pitch >= 36 && n.pitch <= 96));
+const rests = [note(52, 0, 1), note(72, 2.2, 1)];
+assert.equal(assignMelodyHands(rests, noGrid).phrases.length, 2);
+assert.equal(assignMelodyHands(rests, { ...grid, estimatedBpm: 60 }).phrases.length, 1, 'Accepted tempo uses two beats');
+
+const harmonyNotes = [];
+for (const [i, pitches] of [[48, 52, 55], [43, 47, 50], [45, 48, 52], [41, 45, 48]].entries()) {
+  for (let t = i * 4; t < i * 4 + 4; t += 0.5) for (const pitch of pitches) harmonyNotes.push(note(pitch, t, 0.48));
+}
+const harmony = inferChords(harmonyNotes, grid);
+assert.deepEqual(harmony.segments.map(s => s.root), [0, 7, 9, 5]);
+assert.deepEqual(harmony.segments.map(s => s.label), ['C', 'G', 'Am', 'F']);
+assert.equal(inferChords([], noGrid).segments.length, 0);
+const ambiguous = [...phrase(48, 0), ...phrase(55, 0)];
+const majorMelody = inferChords(ambiguous, grid, null, { melody: phrase(64, 0) });
+const minorMelody = inferChords(ambiguous, grid, null, { melody: phrase(63, 0) });
+assert.equal(majorMelody.segments[0].label, 'C', 'A strong-beat major third rewards the major template');
+assert.equal(minorMelody.segments[0].label, 'Cm', 'A strong-beat minor third rewards the minor template');
+
+const clashing = [
+  { ...note(60, 0, 2), hand: 'right', role: 'melody' },
+  { ...note(59, 0, 2), hand: 'left', role: 'accompaniment', chordTones: [11, 7], registerLow: 48,
+    registerHigh: 59, placement: 'below' },
+];
+const filtered = filterClashes(clashing);
+assert.equal(filtered.length, 2);
+assert.equal(filtered.find(n => n.role === 'accompaniment').pitch, 55, 'B under C is revoiced to the nearest safe chord tone G');
+assert.equal(clashing[1].pitch, 59, 'The post-filter must not mutate caller notes');
+assert.equal(filterClashes([clashing[0], { ...clashing[1], chordTones: [11], registerLow: 59 }]).length, 1,
+  'An impossible chord tone is dropped');
+assert.equal(filterClashes([
+  { ...note(60, 0, 1), hand: 'left', role: 'melody' },
+  { ...note(61, 0, 1), hand: 'right', role: 'accompaniment', chordTones: [1, 4], registerLow: 60,
+    registerHigh: 81, placement: 'above' },
+]).find(n => n.role === 'accompaniment').pitch, 64);
+assert.equal(filterClashes([
+  { ...note(60, 0, 1), hand: 'right', role: 'melody' },
+  { ...note(62, 1, 1), hand: 'right', role: 'melody' },
+  { ...note(59, 0, 2), hand: 'left', role: 'accompaniment', chordTones: [11, 7], registerLow: 48,
+    registerHigh: 59, placement: 'below' },
+]).find(n => n.role === 'accompaniment').pitch, 55, 'A held backing note is checked against the whole overlapping line');
+const regrouped = enforcePlayability([
+  { ...note(40, 0, 1, 0.1), hand: 'left', role: 'bass' },
+  { ...note(52, 0.02, 1, 0.2), hand: 'left', role: 'accompaniment' },
+  { ...note(68, 0.04, 1, 0.4), hand: 'left', role: 'accompaniment' },
+  { ...note(40, 0.05, 0.3, 0.8), hand: 'right', role: 'melody' },
+]);
+assert.ok(!regrouped.some(n => n.pitch === 52), 'Removing a short anchor must re-check the newly joined attack group');
+for (const group of groupBy30(regrouped)) for (const hand of ['left', 'right']) {
+  const pitches = group.filter(n => n.hand === hand).map(n => n.pitch);
+  if (pitches.length) assert.ok(Math.max(...pitches) - Math.min(...pitches) <= 14);
+}
+const independentlyAnchored = enforcePlayability([
+  { ...note(60, 0, 1), hand: 'right', role: 'melody' },
+  { ...note(40, 0.02, 1, 0.2), hand: 'left', role: 'accompaniment' },
+  { ...note(56, 0.04, 1, 0.4), hand: 'left', role: 'accompaniment' },
+]);
+assert.ok(!independentlyAnchored.some(n => n.pitch === 40),
+  'Each hand also has its own 30 ms anchors, independent of the other hand');
+const roundedGroups = enforcePlayability([
+  { ...note(60, 0, 1), hand: 'right', role: 'melody' },
+  { ...note(40, 0.0204, 1, 0.2), hand: 'left', role: 'accompaniment' },
+  { ...note(56, 0.0505, 1, 0.4), hand: 'left', role: 'accompaniment' },
+]);
+assert.ok(!roundedGroups.some(n => n.pitch === 40),
+  'MIDI tick rounding can join notes that were just over 30 ms apart');
+const leftRootOverlap = enforcePlayability([
+  { ...note(48, 0, 1, 0.4), hand: 'left', role: 'bass' },
+  { ...note(52, 0.1, 1, 0.5), hand: 'left', role: 'bass' },
+  { ...note(60, 0.2, 0.3), hand: 'left', role: 'melody' },
+]);
+assert.ok(leftRootOverlap.filter(n => n.startTimeSeconds <= 0.2 &&
+  n.startTimeSeconds + n.durationSeconds > 0.2).length <= 2,
+  'The left hand carries at most melody plus one bass root');
+
+const options = { quantize: false, tempo: noGrid, harmonic: 0, ghost: 0, keyClean: 0, legato: 0,
+  align: 0, chordsOnly: true };
+const voice = (pitch, start = 0) => Array.from({ length: 20 }, (_, i) => note(pitch, start + i * 0.3, 0.27));
+const backing = Array.from({ length: 12 }, (_, i) => [48, 52, 55].map(p => note(p, i * 0.5, 0.48))).flat();
+for (const pitch of [52, 72]) for (const quantize of [false, true]) {
+  const output = arrangeStems(voice(pitch), backing, { ...options, quantize, tempo: quantize ? grid : noGrid });
+  const melody = output.filter(n => n.role === 'melody'), accompaniment = output.filter(n => n.role !== 'melody');
+  assert.equal(output.noVocals, false);
+  assert.equal(output.vocalMedianPitch, pitch);
+  assert.ok(melody.length >= 15);
+  assert.ok(melody.every(n => n.pitch === pitch), 'The melody remains at its real pitch');
+  assert.ok(melody.every(n => n.hand === (pitch < 60 ? 'left' : 'right')));
+  assert.ok(accompaniment.some(n => n.hand === (pitch < 60 ? 'right' : 'left')));
+  for (const n of accompaniment) for (const m of melody) {
+    if (n.startTimeSeconds >= m.startTimeSeconds + m.durationSeconds - 1e-9 ||
+      m.startTimeSeconds >= n.startTimeSeconds + n.durationSeconds - 1e-9) continue;
+    assert.ok(![1, 11].includes(Math.abs(n.pitch - m.pitch) % 12));
+    if (pitch >= 60) assert.ok(n.pitch <= m.pitch - 2);
+    else if (n.hand === 'right') assert.ok(n.pitch >= Math.max(60, pitch + 3) && n.pitch <= 81);
+    else assert.ok(m.pitch - n.pitch >= 5 && m.pitch - n.pitch <= 12);
+  }
+  for (const group of groupBy30(output)) for (const hand of ['left', 'right']) {
+    const pitches = group.filter(n => n.hand === hand).map(n => n.pitch);
+    assert.ok(pitches.length <= 5);
+    if (pitches.length) assert.ok(Math.max(...pitches) - Math.min(...pitches) <= 14);
+  }
+  assert.ok(output.every(n => n.durationSeconds > 0));
+  const stats = noteStats(output);
+  assert.equal(stats.clashPct, 0);
+  assert.ok(stats.maxSoundingAtOnce <= 4);
+  const midi = new midiPackage.Midi(notesToMidi(output));
+  const midiNotes = midi.tracks.flatMap((track, hand) => track.notes.map(n => ({ ...n, hand })));
+  for (const n of midiNotes) {
+    assert.ok(n.durationTicks > 0);
+    for (const m of midiNotes) if (m !== n && m.midi === n.midi) {
+      assert.ok(n.ticks + n.durationTicks <= m.ticks || m.ticks + m.durationTicks <= n.ticks);
+    }
+  }
+}
+const instrumentalOnly = arrangeStems([], harmonyNotes.map(n => ({ ...n, pitch: n.pitch + 12 })), options);
+assert.equal(instrumentalOnly.noVocals, true);
+assert.ok(instrumentalOnly.some(n => n.role === 'melody'));
+const withGap = arrangeStems([...voice(72), ...voice(72, 10)],
+  Array.from({ length: 32 }, (_, i) => [48, 55, 64].map(p => note(p, i * 0.5, 0.45))).flat(), options);
+assert.ok(withGap.some(n => n.role === 'melody' && n.startTimeSeconds > 6.2 && n.startTimeSeconds < 9.9),
+  'A long vocal rest receives an instrumental melody');
+assert.equal(arrangeStems([], [], options).length, 0);
+const fastVocal = Array.from({ length: 20 }, (_, i) => note(52 + i % 2, i * 0.18, 0.14));
+const protectedVocal = arrangeStems(fastVocal, [], { ...options, quantize: true, rhLegato: 0,
+  tempo: { ...grid, estimatedBpm: 126 } });
+assert.equal(protectedVocal.length, fastVocal.length);
+assert.ok(protectedVocal.every(n => n.durationSeconds >= 0.12 - 1e-9),
+  'A 119 ms sixteenth must not shorten a valid vocal note below the tracker floor');
+for (let i = 1; i < protectedVocal.length; i++) assert.ok(
+  protectedVocal[i].startTimeSeconds - protectedVocal[i - 1].startTimeSeconds >= 0.16 - 1e-9,
+  'Grid snapping must preserve the melody onset spacing');
+const steadyAttacks = Array.from({ length: 40 }, (_, i) => ({ ...note(60, 0.03 + i * 0.5, 0.2), onset: 0.9 }));
+const continuations = Array.from({ length: 45 }, (_, i) => ({ ...note(53 + i % 3, 0.11 + i * 0.41, 1.4), onset: 0 }));
+const attackArrangement = arrangeStems([], steadyAttacks, { ...options, tempo: undefined, quantize: true });
+const sustainArrangement = arrangeStems([], [...steadyAttacks, ...continuations], { ...options, tempo: undefined, quantize: true });
+assert.equal(attackArrangement.estimatedBpm, sustainArrangement.estimatedBpm);
+assert.equal(attackArrangement.gridPhaseSeconds, sustainArrangement.gridPhaseSeconds,
+  'Adding onset-less harmonic continuations must not move the attack-derived beat grid');
+
+console.log('stems arrangement, native-register hands, fallback, clash, and MIDI invariant tests passed');

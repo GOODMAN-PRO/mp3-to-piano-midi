@@ -1,6 +1,6 @@
 # MP3 to Piano MIDI
 
-A browser-only MP3/audio converter using Spotify Basic Pitch. Audio stays on your device. The result is an approximate piano arrangement, especially for full mixes; it is not a score transcription. Exports use the 88-key range, piano instruments, no pitch bends, and an estimated tempo when beat quantization is accepted (otherwise 120 BPM with original timing).
+A static browser app and Node CLI for MP3/audio to piano MIDI. Audio stays on your device. The result is an approximate piano arrangement, not a score transcription. Exports use piano instruments, no pitch bends, and an estimated tempo when beat quantization is accepted (otherwise 120 BPM with original timing). The browser currently uses Spotify Basic Pitch on the full mix; the CLI defaults to vocal separation.
 
 ## Run
 
@@ -53,15 +53,43 @@ Requires **ffmpeg on PATH** and Node 24:
 
 ```sh
 node cli.mjs "song.mp3" --out "song.mid" --json
-node cli.mjs "song.mp3" --out "song-easy.mid" --preset easy --json
+node cli.mjs "song.mp3" --classic --out "song-easy.mid" --preset easy --json
 node cli.mjs --help
 ```
 
-Without `--out`, the MIDI is written beside the input. CPU inference can take several minutes. Model outputs are cached in `.cache/` by basename and size, checked against source path/mtime and model timestamp; parameter changes reuse inference. Delete the matching cache to force inference. Decoding is limited to 256 MiB of mono 22050 Hz float audio (about 50 minutes); split longer files first.
+Without `--out`, the MIDI is written beside the input. CPU inference can take several minutes. Model outputs are cached in `.cache/` by basename and size, checked against source path/mtime and model timestamp; parameter changes reuse inference. Delete the matching cache to force inference. Classic decoding is limited to 256 MiB of mono 22050 Hz float audio (about 50 minutes); stems decoding allows 512 MiB of stereo 44100 Hz float audio (about 25 minutes).
 
-`--json` writes statistics to stdout and progress to stderr. Statistics describe the final arrangement before MIDI tick rounding. Fragments count same-pitch gaps ≤50 ms, including real repeats; chord/hand metrics use anchored 30 ms groups. Sounding metrics cover first onset through last release. Key estimates use duration-weighted [Krumhansl–Schmuckler profiles](https://music21.org/music21docs/_modules/music21/analysis/discrete.html); out-of-key does not necessarily mean wrong. Wobble counts alternating singleton semitone triples ≤150 ms apart. Melody jump rate follows the highest right-hand pitch per group and counts intervals >7 semitones. `estimatedBpm` is the exported tempo; `gridDeviationMs` measures pre-snap starts against the candidate grid (120 BPM grid after rejection). `tempoConfidence` and `phaseConfidence` report the two guards; `quantizedNotes` counts starts accepted for snapping, and `timingOffsetSeconds` records the common shift. Duration percentiles use ms; velocities use 0–1.
+### Vocal melody and instrumental backing (CLI default)
 
-## How the arrangement is built
+The melody comes from the separated vocals, played by whichever hand matches its register; accompaniment comes from the instrumental. Vocal pitches stay at their real octave, folding only outside MIDI 36–96. Phrases use a duration-weighted median: 60 or higher goes right, 57 or lower goes left, and the middle range keeps the previous hand (first phrase: right at 59 or above). Phrases shorter than four seconds share a decision with a neighbouring phrase. Melody rests of at least one second, or two accepted beats, separate phrases.
+
+The other hand plays sparse chord blocks and pulses below or above the melody. Close semitone clashes are revoiced or removed. Vocal gaps of at least two seconds can use an instrumental melody; songs with little detected singing use that fallback throughout. This is a generated arrangement and still needs a listening check.
+
+```sh
+npm i --cache G:\Temp\npm-cache -O onnxruntime-node@1.30.0
+node cli.mjs "song.mp3" --keep-stems ".cache/listen/song" --out "song-stems.mid" --json
+node cli.mjs "song.mp3" --classic --preset cover --out "song-cover.mid"
+```
+
+The optional runtime is loaded only in stems mode. `--ep dml|cpu` chooses separation execution (DirectML on Windows by default, with CPU retry on failure; CPU elsewhere). `--keep-stems <dir>` writes float32 `vocals.wav` and `instrumental.wav`. `--classic` preserves the original Full/Easy/Cover pipeline and does not need ONNX Runtime. The browser controls are unchanged.
+
+Stems tuning: `--theta 0.65` controls vocal detection, `--split-db 6` controls repeated-note energy dips (`99` disables almost all such splits), `--lh-groove 0.6` controls accompaniment pulses in either hand, `--chords-only` removes pulses, and `--rh-legato 350` sets melody gap filling in milliseconds in either hand. `--no-quantize` preserves timing. Classic preset, hand-split boundary and polyphony controls do not select the stems melody or its hand.
+
+Separation decodes at 44.1 kHz stereo without loudness normalisation. Mono is duplicated; for more than two channels, zero-based even channels are averaged into left and odd channels into right. Both stems use a delay-compensated 31-tap Hann-windowed half-band filter to produce 22.05 kHz mono. Instrumental Basic Pitch extraction skips the Melodia continuation pass. Tempo estimation uses detected attacks, so onset-less continuations cannot move the beat grid; chord estimation still uses all supplied notes. The shared separator uses a periodic Hann; the vocal tracker uses a symmetric Hann.
+
+The model is copied from the local research download when available, otherwise downloaded from the [official UVR release](https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_2.onnx), then checked against SHA-256 `ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b`. It stays in ignored `.cache/models/`. Stem inference caches end in `-stems.json` and retain default melody notes plus instrumental frames; a small vocal audio cache supports melody parameter sweeps. Changes to shared audio-processing code invalidate these caches.
+
+Vocal separation: UVR MDX-Net Kim_Vocal_2, trained by Kimberley Jensen, distributed by Ultimate Vocal Remover (MIT code; the model weights are not covered by this repository's licence and are downloaded at runtime, not redistributed).
+
+`npm test` uses synthetic fixtures and does not require ONNX Runtime or personal audio. `npm run test:golden` checks optional local Python stem parity, melody counts and the 21 frozen classic MIDI files; missing local fixtures skip cleanly. Pages CI uses `npm ci --omit=optional`, then restores only Vite's two already-locked Linux native bindings with integrity verification.
+
+See [the run 1 verification report](STEMS-RUN1.md) for measured results, listening-file locations and limitations.
+
+`--json` writes statistics to stdout and progress to stderr. Statistics describe the final arrangement before MIDI tick rounding. Fragments count same-pitch gaps ≤50 ms, including real repeats; chord/hand metrics use anchored 30 ms groups. Sounding metrics cover first onset through last release. Key estimates use duration-weighted [Krumhansl–Schmuckler profiles](https://music21.org/music21docs/_modules/music21/analysis/discrete.html); out-of-key does not necessarily mean wrong. Wobble counts alternating singleton semitone triples ≤150 ms apart. Melody jump rate counts intervals >7 semitones; Classic follows the highest right-hand pitch per group. `estimatedBpm` is the exported tempo; `gridDeviationMs` measures pre-snap starts against the candidate grid (120 BPM grid after rejection). `tempoConfidence` and `phaseConfidence` report the two guards; `quantizedNotes` counts starts accepted for snapping, and `timingOffsetSeconds` records the common shift. Duration percentiles use ms; velocities use 0–1.
+
+Stems statistics use `role === 'melody'`, including instrumental fallback melody, irrespective of hand. `melodyLeftShare` is a fraction of melody note-time. Classic has no role labels: its melody metrics are explicitly marked `highest-right-hand-estimate` and cannot measure a true vocal melody or its left-hand share. `clashPct` is the union of simultaneous semitone-class clashes within 14 semitones divided by melody note-time. `pctUnder120ms` counts short notes; `perHand` reports accompaniment attacks/s, maximum accompaniment attack groups in any one-second window, mean sounding and maximum sounding. Means use the whole arrangement span, including internal rests.
+
+## How the classic arrangement is built
 
 After cleanup and playable hand assignment, Easy/Cover track right-hand candidates with cost −amplitude/voice maximum + 0.08 per semitone travelled + 0.5 for a gap over one second; skipping a group costs 0.5. The tracker can therefore rest instead of borrowing accompaniment during melody gaps. Cover's bass tracker still chooses from every available group with interval weight 0.04 and lower-pitch ties, then retains at most one accompaniment bass attack per accepted beat (300 ms when no tempo is accepted), choosing the largest amplitude × duration capped at one beat, with earlier attacks winning ties. It tries candidates in that order while avoiding same-pitch-class re-attacks during a bass sustain. Both arrangements preserve original singleton left-hand attacks when the final right-hand melody is silent: these may be the tune crossing the hand split, so they keep their hand labels and bypass bass thinning and Easy's short-note filter. Turning off grid snapping preserves this selection. At retained bass attacks, changed left-hand pitch-class sets may add at most two in-key tones from the strongest 40% of original groups. The sounding cap runs before and after guarded quantization.
 
