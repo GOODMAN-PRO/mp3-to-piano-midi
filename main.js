@@ -1,7 +1,7 @@
 import { BasicPitch } from '@spotify/basic-pitch';
 import * as tf from '@tensorflow/tfjs';
 import { extractNotes } from './extract.js';
-import { toPianoNotes } from './piano.js';
+import { pianoDefaults, defaultMaxSounding, toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 
 const form = document.querySelector('#form');
@@ -113,8 +113,10 @@ form.addEventListener('submit', async event => {
 
     status.textContent = 'Creating piano MIDI…';
     failureMessage = 'Could not create the MIDI file. Try converting again.';
-    const notes = extractNotes(frames, onsets, { onsetThresh, frameThresh, minMs });
-    const piano = toPianoNotes(notes, { maxPoly, preset, quantize });
+    const notes = extractNotes(frames, onsets, { ...pianoDefaults, onsetThresh, frameThresh, minMs });
+    const piano = toPianoNotes(notes, {
+      ...pianoDefaults, maxSounding: defaultMaxSounding(preset), maxPoly, preset, quantize,
+    });
 
     const blob = new Blob([notesToMidi(piano, { splitHands })], { type: 'audio/midi' });
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);

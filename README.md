@@ -20,7 +20,7 @@ Automatic controls below are configurable through the CLI; the browser exposes t
 
 | Control | What it does | Default |
 | --- | --- | --- |
-| Arrangement / `--preset` | Full keeps chords; Easy tracks melody plus the lowest bass and drops attacks shorter than 120 ms; Cover tracks melody/bass with sparse chord tones. | `full` |
+| Arrangement / `--preset` | Cover follows a melody that can rest, with bass and sparse chord changes. Easy keeps melody plus the lowest bass and drops attacks shorter than 120 ms. Full keeps transcription chords. | `cover` |
 | Sensitivity / `--onset` | Onset threshold. Lower detects more attacks. | `0.5` |
 | Note threshold / `--frame` | Frame threshold. Lower retains quieter sustain. | `0.3` |
 | Min note length / `--min` | Minimum detection length, in milliseconds. | `80` |
@@ -39,13 +39,13 @@ Automatic controls below are configurable through the CLI; the browser exposes t
 | `--max-sounding` | Releases older sustains when a chord starts; prefers the incoming hand, then oldest/quietest notes. Protects the first 60 ms of each attack. | Full `6`; Easy `5`; Cover `4` |
 | `--key-clean` | Removes out-of-key notes shorter than 200 ms and below this fraction of the local median amplitude within ±1 second. Keeps long or strong chromatic notes. | `0.6` |
 | `--wobble` | Joins alternating semitone runs of singleton hand attacks within this many milliseconds; keeps the pitch with more note-time. Chords and nearby re-strikes are protected. | `0` (off) |
-| `--melody` | Positive enables the fixed-cost melody tracker in Easy/Cover; zero restores highest-note selection. The numeric flag is retained for compatibility. | `3` (on) |
+| `--melody` | Positive enables the melody tracker with rests in Easy/Cover; zero restores highest-note selection. The numeric flag is retained for compatibility. | `3` (on) |
 
-Set a cleanup/length option to `0` to disable it. `--no-dynamics` restores raw amplitudes clamped to 0.05–1. Tracking chooses one candidate from each nonempty hand group, so isolated wrong pitches can still force jumps; it is not vocal isolation. Full remains the default because Cover missed the five-song jump-rate and density targets.
+Set a cleanup/length option to `0` to disable it. `--no-dynamics` restores raw amplitudes clamped to 0.05–1. The earlier tracker forced a choice in every group; its large-jump floor was a design limitation, not unavoidable transcription noise. Resting melody selection and sparser accompaniment make Cover the default: on five test songs its jump rate is 10–15%, time with five sounding notes is 0%, and mean sounding is lower than Full. This is still an estimate from a mix, not vocal isolation.
 
 Each hand is limited to five notes spanning 14 semitones per 30 ms attack group. The boundary may move away from the preferred split; impossible chords lose the quietest offending notes. The sounding cap preserves new attacks and notes younger than 60 ms, so temporary excess polyphony is possible. Sustained notes can still exceed a hand's reach.
 
-A short note is isolated when no same-pitch note starts within 120 ms after its end. Extensions preserve re-strike spacing; multi-note hand attacks skip gap-fill. Beat quantization requires centered onset autocorrelation ≥0.12 and sixteenth-phase concentration ≥0.20. Unsafe re-strikes or newly unplayable groups keep their original relative timing; sounding-cap releases take priority over grid endings/minimums. A common phase shift aligns grid ticks, but does not identify the musical downbeat or meter. `--no-quantize` preserves original timing and 120 BPM.
+A short note is isolated when no same-pitch note starts within 120 ms after its end. Extensions preserve re-strike spacing; multi-note hand attacks skip gap-fill. Beat quantization requires centered onset autocorrelation ≥0.12 and sixteenth-phase concentration ≥0.20; a refined half/double tempo needs ≥1.5 times the phase concentration to replace the original estimate. Unsafe re-strikes revert whole attack groups, preserving chord alignment and attack order. Sounding-cap releases take priority over grid endings/minimums. A common phase shift aligns ticks, not the musical downbeat or meter. `--no-quantize` preserves original timing and 120 BPM.
 
 ## Command line
 
@@ -63,13 +63,13 @@ Without `--out`, the MIDI is written beside the input. CPU inference can take se
 
 ## How the arrangement is built
 
-After cleanup and playable hand assignment, Easy/Cover use dynamic programming over right-hand candidates: cost is negative amplitude normalized by the voice maximum, plus 0.08 per semitone travelled and 0.5 for a gap over one second. Ties prefer higher notes. Cover tracks bass similarly with weight 0.04 and lower-pitch ties, adding at most two in-key left-hand tones on the strongest 40% of original groups by summed amplitude. The sounding cap runs before and after guarded beat quantization to protect releases and avoid new fragments.
+After cleanup and playable hand assignment, Easy/Cover track right-hand candidates with cost −amplitude/voice maximum + 0.08 per semitone travelled + 0.5 for a gap over one second; skipping a group costs 0.6. The tracker can therefore rest instead of borrowing accompaniment during melody gaps. Cover's bass tracker still chooses from every available group with interval weight 0.04 and lower-pitch ties, then retains at most one bass attack per accepted beat (300 ms when no grid is used), avoiding same-pitch-class re-attacks while the bass sustains. At retained bass attacks, changed left-hand pitch-class sets may add at most two in-key tones from the strongest 40% of original groups. The sounding cap runs before and after guarded quantization.
 
 - `extract.js`: model frames/onsets → timed notes; subtracts one frame from Basic Pitch's exclusive minimum-length cutoff and labels onset-less continuations with zero onset.
 - `piano.js`: shared cleanup, voice tracking, tempo estimation, quantization, and dynamics. Removed anchors trigger regrouping. Inputs are unchanged; array metadata carries hand, tempo, and timing diagnostics.
-- `midi.js`: hand-labelled notes → explicit ticks at the estimated tempo. Same-tick same-pitch attacks coalesce; earlier notes are clipped at re-strikes to prevent zero lengths and overlaps across tracks.
+- `midi.js`: hand-labelled notes → explicit ticks at the estimated tempo. Same-tick same-pitch attacks coalesce; cross-hand re-strikes leave a one-tick release gap. Adjacent-tick handoffs coalesce when a positive note and release gap cannot both fit.
 
-`main.js` decodes browser audio and reuses one scoped model with WebGL-to-CPU fallback; `cli.mjs` handles ffmpeg, local inference caching, and statistics. `test/piano.test.mjs` checks the shared pipeline, MIDI round trips, and browser controls. Keep module/CLI/HTML defaults aligned. TensorFlow is overridden to 4.22 because 3.21 had a WebGL concat-shader failure. No server is needed in production.
+`pianoDefaults` and `defaultMaxSounding(preset)` in `piano.js` are the shared defaults; HTML values are checked by tests. `main.js` decodes browser audio and reuses one scoped model with WebGL-to-CPU fallback; `cli.mjs` handles ffmpeg, local inference caching, and statistics. Tests cover the shared pipeline, MIDI round trips, rich browser/CLI parity and a quantized browser download. TensorFlow is overridden to 4.22 because 3.21 had a WebGL concat-shader failure. No server is needed in production.
 
 ## Getting the MIDI onto a Meta Quest 3
 

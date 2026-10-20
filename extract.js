@@ -1,7 +1,9 @@
 import { noteFramesToTime, outputToNotesPoly } from '@spotify/basic-pitch';
+import { pianoDefaults } from './piano.js';
 
 export function extractNotes(frames, onsets, {
-  onsetThresh = 0.5, frameThresh = 0.3, minMs = 80, energyTolerance = 11,
+  onsetThresh = pianoDefaults.onsetThresh, frameThresh = pianoDefaults.frameThresh,
+  minMs = pianoDefaults.minMs, energyTolerance = pianoDefaults.energyTolerance,
 } = {}) {
   if (!frames.length) return [];
   // Missing onset data still has usable frame energy for Melodia continuations.

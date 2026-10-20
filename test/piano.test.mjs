@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import midiPackage from '@tonejs/midi/build/Midi.js';
 import { extractNotes } from '../extract.js';
-import { estimateKey, estimateTempo, quantizeNotes, trackVoice,
+import { estimateKey, estimateTempo, quantizeNotes, trackVoice, trackMelody, pianoDefaults, defaultMaxSounding,
   toPianoNotes as pianoWithLengthDefaults } from '../piano.js';
 import { notesToMidi } from '../midi.js';
 import { defaults, noteStats } from '../cli.mjs';
@@ -15,7 +15,7 @@ const note = (pitchMidi, startTimeSeconds = 0, durationSeconds = 1, amplitude = 
   ({ pitchMidi, startTimeSeconds, durationSeconds, amplitude });
 // Keep the original processing assertions isolated from the new optional stages.
 const pianoWithDefaults = (notes, options = {}) =>
-  pianoWithLengthDefaults(notes, { minSounding: 0, legatoGap: 0, maxSounding: 0, keyClean: 0, wobble: 0,
+  pianoWithLengthDefaults(notes, { preset: 'full', minSounding: 0, legatoGap: 0, maxSounding: 0, keyClean: 0, wobble: 0,
     melody: 0, quantize: false, ...options });
 const toPianoNotes = (notes, options = {}) =>
   pianoWithDefaults(notes, { align: 0, dynamics: false, ghost: 0, ...options })
@@ -231,7 +231,7 @@ assert.equal(noteStats(shiftedAnchor).handSpanViolations, 0);
 assert.equal(noteStats(shiftedAnchor).handPolyViolations, 0);
 
 const lengthNotes = (notes, options = {}) => pianoWithLengthDefaults(notes, {
-  legato: 0, harmonic: 0, align: 0, dynamics: false, ghost: 0, splitAt: 60,
+  preset: 'full', legato: 0, harmonic: 0, align: 0, dynamics: false, ghost: 0, splitAt: 60,
   maxSounding: 0, keyClean: 0, wobble: 0, melody: 0, minSounding: 120,
   legatoGap: options.preset === 'easy' ? 150 : 100, quantize: false, ...options,
 });
@@ -408,6 +408,34 @@ assert.deepEqual(trackVoice([
 assert.deepEqual(trackVoice(voiceGroups.map(group => group.map(n => ({ ...n, amplitude: n.amplitude * 0.2 }))))
   .map(n => n.pitch), voice.map(n => n.pitch));
 
+// A melody gap may contain accompaniment: resting is better than inserting a two-octave detour.
+const restingGroups = [[voiceNote(60, 0)], [voiceNote(84, 0.5)], [voiceNote(60, 1)]];
+const restingOriginal = structuredClone(restingGroups);
+assert.deepEqual(trackMelody(restingGroups).map(n => n.pitch), [60, 60]);
+assert.deepEqual(trackVoice(restingGroups).map(n => n.pitch), [60, 84, 60]); // Bass remains forced.
+assert.equal(trackMelody(restingGroups)[1], restingGroups[2][0]);
+assert.deepEqual(restingGroups, restingOriginal);
+assert.deepEqual(trackMelody([]), []);
+assert.deepEqual(trackMelody([[], []]), []);
+assert.deepEqual(trackMelody([[], ...voiceGroups, []]).map(n => n.pitch), [60, 62, 64]);
+// Exhaust all 36 choices on a tiny phrase, including rests; check the objective independently of the DP.
+const optionalGroups = [
+  [voiceNote(60, 0, 1), voiceNote(72, 0, 0.9, 1.5)], [voiceNote(84, 0.5, 0.8)], [],
+  [voiceNote(62, 2, 0.7), voiceNote(74, 2, 1)], [voiceNote(60, 2.5, 0.9)],
+];
+const possibleLines = optionalGroups.reduce((lines, group) =>
+  lines.flatMap(line => [line, ...group.map(n => [...line, n])]), [[]]);
+const melodyCost = line => {
+  let cost = (optionalGroups.length - line.length) * 0.6;
+  for (let i = 0; i < line.length; i++) {
+    cost -= line[i].amplitude;
+    if (i) cost += 0.08 * Math.abs(line[i].pitch - line[i - 1].pitch) +
+      (line[i].startTimeSeconds - line[i - 1].startTimeSeconds - line[i - 1].durationSeconds > 1 ? 0.5 : 0);
+  }
+  return cost;
+};
+close(melodyCost(trackMelody(optionalGroups)), Math.min(...possibleLines.map(melodyCost)));
+
 const melodyInput = [note(60, 0, 0.2), note(62, 1, 0.2), note(74, 1, 0.2)];
 const melodic = coherenceNotes(melodyInput, { preset: 'easy', melody: 3 });
 assert.deepEqual(melodic.map(n => n.pitch), [60, 62]);
@@ -424,7 +452,7 @@ for (const input of [nearbyRepeat, futureRepeat]) {
 }
 assert.deepEqual(coherenceNotes(melodyInput, { preset: 'easy', melody: 3 }), melodic);
 
-// Cover gives chord tones only to the strongest 40% of groups, and excludes chromatic inner voices.
+// Cover gives chord tones to strong chord changes, and excludes chromatic inner voices.
 const coverInput = Array.from({ length: 5 }, (_, i) => [48, 52, 55, 58, 72]
   .map(pitch => note(pitch, i * 2, pitch === 58 ? 0.15 : 1, (i + 1) / 5))).flat();
 const coverOriginal = structuredClone(coverInput);
@@ -434,7 +462,7 @@ for (let group = 0; group < 5; group++) {
   const sounding = coverNotes.filter(n => n.startTimeSeconds === group * 2);
   assert.deepEqual(sounding.filter(n => n.hand === 'right').map(n => n.pitch), [72]);
   assert.deepEqual(sounding.filter(n => n.hand === 'left').map(n => n.pitch),
-    group < 3 ? [48] : [48, 52, 55]);
+    group === 3 ? [48, 52, 55] : [48]); // The final group repeats the same pitch-class set.
   fitsHands(sounding);
 }
 assert.deepEqual(coverInput, coverOriginal);
@@ -446,6 +474,25 @@ for (const pitch of [48, 72]) {
   assert.ok(oneHandCover.every(n => n.hand === (pitch === 48 ? 'left' : 'right')));
 }
 assert.equal(coherenceNotes([], { preset: 'cover' }).length, 0);
+// Without an accepted grid Cover allows one bass attack per 300 ms, without thinning the melody.
+const busyBass = [0, 0.1, 0.31, 0.4].flatMap((start, i) => [
+  note([48, 50, 52, 53][i], start, 0.2), note([72, 74, 76, 77][i], start, 0.2),
+]);
+const sparseCover = coherenceNotes(busyBass, { preset: 'cover', melody: 3 });
+const busyEasy = coherenceNotes(busyBass, { preset: 'easy', melody: 3 });
+assert.deepEqual(sparseCover.filter(n => n.hand === 'left').map(n => n.pitch), [48, 52]);
+assert.deepEqual(sparseCover.filter(n => n.hand === 'right'), busyEasy.filter(n => n.hand === 'right'));
+assert.ok(noteStats(sparseCover).notesPerSec < noteStats(busyEasy).notesPerSec);
+assert.ok(noteStats(sparseCover).meanSounding < noteStats(busyEasy).meanSounding);
+const heldBassClass = coherenceNotes([
+  note(48, 0, 1), note(80, 0, 0.2), note(60, 0.4, 0.2), note(82, 0.4, 0.2),
+], { preset: 'cover', splitAt: 72, melody: 3 });
+assert.deepEqual(heldBassClass.filter(n => n.hand === 'left').map(n => n.pitch), [48]);
+assert.deepEqual(heldBassClass.filter(n => n.hand === 'right').map(n => n.pitch), [80, 82]);
+const thinnedLegato = coherenceNotes([...coverInput, note(50, 9.08, 0.2, 0.1)], {
+  preset: 'cover', melody: 3, legatoGap: 100,
+});
+close(thinnedLegato.find(n => n.pitch === 48 && n.startTimeSeconds === 8).durationSeconds, 1.08);
 
 const clicks100 = Array.from({ length: 40 }, (_, i) => ({
   ...voiceNote(60, 0.037 + i * 0.6, 1, 0.1), onset: 1,
@@ -475,6 +522,18 @@ assert.ok(uncertainTempo.tempoConfidence < 0.12);
 // An enormous timestamp/span must fail closed, rather than allocate a giant onset curve.
 assert.equal(estimateTempo([voiceNote(60, 0, 1, 1e20)]).eligible, false);
 
+// A weak alternate-beat onset pattern fooled autocorrelation into choosing 65 BPM.
+// Its sixteenth-note phase is substantially more concentrated at the true 130 BPM octave.
+const octaveWeights = [1, 0.3, 0, 0, 0.1, 0.3, 0, 0];
+const octavePattern = Array.from({ length: 256 }, (_, i) => ({
+  startTimeSeconds: i * 60 / 130 / 4, durationSeconds: 0.08,
+  amplitude: octaveWeights[i % 8], onset: 1,
+})).filter(n => n.amplitude);
+const octaveTempo = estimateTempo(octavePattern);
+assert.equal(octaveTempo.eligible, true);
+assert.ok(Math.abs(octaveTempo.estimatedBpm - 130) < 0.1);
+assert.ok(octaveTempo.phaseConfidence > 0.99);
+
 const internalNote = (pitch, startTimeSeconds, end, hand = 'right') =>
   ({ pitch, startTimeSeconds, end, hand, amplitude: 0.8 });
 const exactGrid = { ...clickTempo, estimatedBpm: 100, gridPhaseSeconds: 0.037 };
@@ -499,6 +558,20 @@ for (const guarded of [quantizeNotes(offGrid, exactGrid, { enabled: false }),
 }
 const fromInternal = notes => notes.map(({ end, ...n }) => ({ ...n, durationSeconds: end - n.startTimeSeconds }));
 const gridWithoutPhase = { ...exactGrid, gridPhaseSeconds: 0 };
+// Protect the entire attack when one re-strike cannot snap, so its chord partners cannot become flams.
+const reStrikeChord = [
+  internalNote(60, 9.9, 10.02),
+  ...[60, 64, 67].map(pitch => internalNote(pitch, 10.09, 10.39)),
+];
+const protectedChord = quantizeNotes(reStrikeChord, gridWithoutPhase);
+assert.deepEqual(protectedChord.notes.slice(1).map(n => n.startTimeSeconds), [10.09, 10.09, 10.09]);
+// Reverting a re-strike must not move it ahead of an originally earlier attack in the same hand.
+const attackOrder = [
+  internalNote(60, 0.08, 0.28), internalNote(64, 0.12, 0.16), internalNote(64, 0.19, 0.31),
+];
+const orderedGrid = quantizeNotes(attackOrder, gridWithoutPhase);
+assert.deepEqual(orderedGrid.notes.map(n => n.pitch), [60, 64, 64]);
+assert.deepEqual(orderedGrid.notes.map(n => n.startTimeSeconds), [0.08, 0.12, 0.19]);
 for (const repeated of [
   [internalNote(60, 0.02, 0.06), internalNote(60, 0.08, 0.12)],
   [internalNote(60, 0, 0.1), internalNote(60, 0.22, 0.3)],
@@ -637,9 +710,26 @@ const subTick = readableMidi([
 ]);
 const quantized = subTick.tracks.flatMap(track => track.notes).sort((a, b) => a.ticks - b.ticks);
 assert.equal(quantized.length, 2);
-assert.equal(quantized[0].ticks + quantized[0].durationTicks, quantized[1].ticks);
+assert.equal(quantized[0].ticks + quantized[0].durationTicks, quantized[1].ticks - 1);
 assert.equal(subTick.tracks[0].notes[0].velocity, Math.floor(0.8 * 127) / 127);
 assert.ok(quantized.every(n => n.durationTicks > 0));
+// A right-to-left pitch handoff needs a tick of silence: the left track is encoded first.
+const handoff = [
+  { pitch: 55, hand: 'right', startTimeSeconds: 0, durationSeconds: 0.5, velocity: 0.7 },
+  { pitch: 55, hand: 'left', startTimeSeconds: 0.5, durationSeconds: 0.5, velocity: 0.8 },
+];
+const handoffMidi = readableMidi(handoff);
+const handoffLeft = handoffMidi.tracks[0].notes[0], handoffRight = handoffMidi.tracks[1].notes[0];
+assert.equal(handoffLeft.ticks, 480);
+assert.equal(handoffRight.ticks + handoffRight.durationTicks, handoffLeft.ticks - 1);
+const handoffSingle = new midiPackage.Midi(notesToMidi(handoff, { splitHands: false })).tracks[0].notes;
+assert.equal(handoffSingle[0].ticks + handoffSingle[0].durationTicks, handoffSingle[1].ticks);
+const adjacentHandoff = readableMidi([
+  { ...handoff[0], durationSeconds: 1 / 960 },
+  { ...handoff[1], startTimeSeconds: 1 / 960 },
+]).tracks.flatMap(track => track.notes);
+assert.equal(adjacentHandoff.length, 1);
+assert.ok(adjacentHandoff[0].durationTicks > 1);
 const invalidMidi = readableMidi([
   null,
   { pitch: 60, startTimeSeconds: NaN, durationSeconds: 1, velocity: 1 },
@@ -854,7 +944,7 @@ try {
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const browserSource = readFileSync(new URL('../main.js', import.meta.url), 'utf8')
   .replace(/^import .*;\r?\n/gm, '').replace('import.meta.env.BASE_URL', '"/"');
-async function browserRun(preset, { empty = false, fail = false, quantize } = {}) {
+async function browserRun(preset, { empty = false, fail = false, quantize, fixture, splitHands } = {}) {
   const elements = new Map();
   const element = selector => {
     if (!elements.has(selector)) {
@@ -866,32 +956,37 @@ async function browserRun(preset, { empty = false, fail = false, quantize } = {}
   };
   element('#preset').value = preset;
   if (quantize !== undefined) element('#quantize').checked = quantize;
+  if (splitHands !== undefined) element('#split').checked = splitHands;
   element('#file').files = [{ name: 'song.mp3', arrayBuffer: async () => new ArrayBuffer(0) }];
-  let extractionOptions, pianoOptions, output;
+  let extractionOptions, pianoOptions, output, midiBytes, midiOptions, downloadBlob;
   runInNewContext(browserSource, {
+    pianoDefaults, defaultMaxSounding,
     document: { querySelector: element, getElementById: id => element(`#${id}`) },
     AudioContext: class { async decodeAudioData() { return { length: 1, numberOfChannels: 1,
       sampleRate: 22050, getChannelData: () => new Float32Array(1) }; } async close() {} },
     BasicPitch: class { model = Promise.resolve(); async evaluateModel(_, complete, progress) {
-      complete(empty ? [] : frames, empty ? [] : strongOnsets); progress(1);
+      complete(empty ? [] : fixture?.frames ?? frames, empty ? [] : fixture?.onsets ?? strongOnsets); progress(1);
     } },
     tf: { engine: () => ({ startScope() {}, endScope() {} }), getBackend: () => 'cpu' },
     extractNotes: (f, o, options) => { extractionOptions = options; if (fail) throw new Error('extract failed');
-      return extractNotes(f, o, options); },
+      return fixture?.notes ?? extractNotes(f, o, options); },
     toPianoNotes: (notes, options) => { pianoOptions = options; return pianoWithLengthDefaults(notes, options); },
-    notesToMidi: (notes, options) => { output = notes; return notesToMidi(notes, options); },
-    Blob, URL: { createObjectURL: () => 'blob:test', revokeObjectURL() {} }, console: { error() {}, warn() {} },
+    notesToMidi: (notes, options) => {
+      output = notes; midiOptions = options; midiBytes = notesToMidi(notes, options); return midiBytes;
+    },
+    Blob, URL: { createObjectURL: blob => { downloadBlob = blob; return 'blob:test'; }, revokeObjectURL() {} },
+    console: { error() {}, warn() {} },
   });
   await element('#form').listeners.submit({ preventDefault() {} });
   assert.equal(element('#controls').disabled, false);
   assert.equal(element('#convert').disabled, false);
-  return { element, extractionOptions, pianoOptions, output };
+  if (downloadBlob) midiBytes = new Uint8Array(await downloadBlob.arrayBuffer());
+  return { element, extractionOptions, pianoOptions, output, midiBytes, midiOptions };
 }
-const cliExtraction = { onsetThresh: defaults.onset, frameThresh: defaults.frame, minMs: defaults.min };
-const cliPiano = { maxPoly: defaults.poly, legato: defaults.legato, harmonic: defaults.harmonic,
-  align: defaults.align, ghost: defaults.ghost, splitAt: defaults.splitAt, minSounding: defaults.minSounding,
-  legatoGap: defaults.legatoGap, maxSounding: defaults.maxSounding, keyClean: defaults.keyClean,
-  wobble: defaults.wobble, melody: defaults.melody, quantize: defaults.quantize };
+const cliExtraction = {
+  onsetThresh: defaults.onset, frameThresh: defaults.frame, minMs: defaults.min, energyTolerance: defaults.tolerance,
+};
+const cliPiano = { ...defaults, maxPoly: defaults.poly };
 const presetMarkup = html.match(/<select id="preset">([\s\S]*?)<\/select>/)[1];
 assert.deepEqual([...presetMarkup.matchAll(/<option[^>]*value="([^"]+)"/g)].map(match => match[1]),
   ['full', 'easy', 'cover']);
@@ -900,17 +995,19 @@ const selectedPresetTag = presetTags.find(tag => /\bselected\b/.test(tag)) ?? pr
 assert.equal(selectedPresetTag.match(/value="([^"]+)"/)[1], defaults.preset);
 for (const preset of ['full', 'easy', 'cover']) {
   const browser = await browserRun(preset);
-  assert.deepEqual({ ...browser.extractionOptions }, cliExtraction);
-  assert.deepEqual({ ...browser.pianoOptions }, { maxPoly: defaults.poly, preset, quantize: defaults.quantize });
-  const cliNotes = pianoWithLengthDefaults(extractNotes(frames, strongOnsets, {
-    ...cliExtraction, energyTolerance: defaults.tolerance,
-  }), { ...cliPiano, maxSounding: preset === 'cover' ? 4 : preset === 'easy' ? 5 : defaults.maxSounding, preset });
+  assert.deepEqual({ ...browser.extractionOptions }, { ...pianoDefaults, ...cliExtraction });
+  assert.deepEqual({ ...browser.pianoOptions }, {
+    ...pianoDefaults, maxPoly: defaults.poly, maxSounding: defaultMaxSounding(preset), preset, quantize: defaults.quantize,
+  });
+  const cliNotes = pianoWithLengthDefaults(extractNotes(frames, strongOnsets, cliExtraction),
+    { ...cliPiano, maxSounding: defaultMaxSounding(preset), preset });
   assert.deepEqual(browser.output, cliNotes);
   assert.match(browser.element('#summary').textContent, new RegExp(`^${cliNotes.length} notes`));
   assert.equal(browser.element('#download').hidden, false);
   const empty = await browserRun(preset, { empty: true });
   assert.match(empty.element('#summary').textContent, /^0 notes/);
-  assert.match(empty.element('#status').textContent, preset === 'full' ? /lowering the thresholds/ : /Try Full/);
+  assert.match(empty.element('#status').textContent, preset === 'full' ? /lowering the thresholds/
+    : new RegExp(`No notes remain in ${preset === 'cover' ? 'Cover' : 'Easy'}\\.`));
 }
 const browserUnquantized = await browserRun('full', { quantize: false });
 assert.equal(browserUnquantized.pianoOptions.quantize, false);
@@ -932,6 +1029,67 @@ const defaultsFixture = [
   ...wobbleInput.map(n => ({ ...n, startTimeSeconds: n.startTimeSeconds + 20 })),
 ];
 assert.deepEqual(pianoWithLengthDefaults(defaultsFixture), pianoWithLengthDefaults(defaultsFixture, cliPiano));
+assert.deepEqual(pianoWithLengthDefaults(defaultsFixture),
+  pianoWithLengthDefaults(defaultsFixture, Object.fromEntries(Object.keys(pianoDefaults).map(key => [key, undefined]))),
+  'Explicit undefined options still use their defaults');
+
+// A 24 s click track exercises the browser's real extraction, grid, MIDI tempo and checkbox forwarding.
+const clickFrames = Array.from({ length: 2100 }, () => Array(88).fill(0));
+const clickOnsets = Array.from({ length: 2100 }, () => Array(88).fill(0));
+for (let k = 0; k < 40; k++) {
+  const start = Math.round(k * 0.6 * 22050 / 256) + 3;
+  clickOnsets[start][39] = 0.9;
+  for (let f = start; f < start + 20; f++) clickFrames[f][39] = 0.7;
+}
+const browserClicks = { frames: clickFrames, onsets: clickOnsets };
+for (const preset of ['full', 'easy', 'cover']) {
+  const run = await browserRun(preset, { fixture: browserClicks });
+  assert.equal(run.output.quantized, true, preset);
+  assert.ok(Math.abs(run.output.estimatedBpm - 100) < 1, preset);
+  assert.equal(run.output.length, 40, preset);
+  assert.match(run.element('#summary').textContent, /^40 notes · [0-9.]+ seconds · [0-9.]+ BPM grid$/);
+  assert.ok(run.element('#summary').textContent.endsWith(`${run.output.estimatedBpm.toFixed(1)} BPM grid`));
+  assert.ok(Math.abs(new midiPackage.Midi(run.midiBytes).header.tempos[0].bpm - run.output.estimatedBpm) < 0.01);
+  assert.equal(run.midiOptions.splitHands, true);
+  const off = await browserRun(preset, { fixture: browserClicks, quantize: false });
+  assert.equal(off.output.quantized, false);
+  assert.equal(off.output.estimatedBpm, 120);
+  assert.match(off.element('#summary').textContent, / · original timing$/);
+  assert.equal(new midiPackage.Midi(off.midiBytes).header.tempos[0].bpm, 120);
+  const single = await browserRun(preset, { fixture: browserClicks, splitHands: false });
+  assert.equal(single.midiOptions.splitHands, false);
+  assert.equal(new midiPackage.Midi(single.midiBytes).tracks.length, 1);
+}
+
+// This varied 36 s fixture exposes defaults that a single short note cannot exercise.
+let paritySeed = 7;
+const parityRandom = () => (paritySeed = (Math.imul(paritySeed, 1664525) + 1013904223) >>> 0) / 2 ** 32;
+const parityScale = [0, 2, 4, 5, 7, 9, 11], richSong = [];
+let degree = 28;
+for (let step = 0; step < 240; step++) {
+  const start = Math.max(0, step * 0.15 + (parityRandom() - 0.5) * 0.02);
+  if (step % 2 === 0) {
+    degree = Math.max(21, Math.min(35, degree + Math.floor(parityRandom() * 5) - 2));
+    richSong.push(withOnset(24 + Math.floor(degree / 7) * 12 + parityScale[degree % 7],
+      start, 0.15 + parityRandom() * 0.5, 0.5 + parityRandom() * 0.5, 0.9));
+  }
+  if (step % 8 === 0) {
+    for (const pitch of [36, 48, 52, 55, 60, 64].slice(0, 3 + Math.floor(parityRandom() * 4))) {
+      richSong.push(withOnset(pitch, start + parityRandom() * 0.02, 1.2, 0.3 + parityRandom() * 0.6, 0.8));
+    }
+  }
+  if (step % 5 === 0) {
+    richSong.push(withOnset(61 + Math.floor(parityRandom() * 3) * 2, start + 0.04, 0.17, 0.3, 0.4));
+  }
+}
+for (const preset of ['full', 'easy', 'cover']) {
+  const browser = await browserRun(preset, { fixture: { notes: richSong } });
+  const cli = pianoWithLengthDefaults(richSong, {
+    ...cliPiano, preset, maxSounding: defaultMaxSounding(preset),
+  });
+  assert.deepEqual(browser.output, cli, `Browser / CLI defaults differ for ${preset}`);
+  assert.deepEqual(browser.midiBytes, notesToMidi(cli), `Browser / CLI MIDI differs for ${preset}`);
+}
 const failedBrowser = await browserRun('full', { fail: true });
 assert.match(failedBrowser.element('#status').textContent, /Could not create the MIDI file/);
 assert.equal(failedBrowser.element('#download').hidden, true);

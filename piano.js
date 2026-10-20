@@ -1,3 +1,14 @@
+// Browser, CLI and direct callers share these conversion defaults.
+export const pianoDefaults = Object.freeze({
+  onsetThresh: 0.5, frameThresh: 0.3, minMs: 80, energyTolerance: 11,
+  maxPoly: 6, legato: 0.7, harmonic: 0.6, align: 30, dynamics: true, ghost: 0.35,
+  splitAt: 0, preset: 'cover', minSounding: 100, legatoGap: 0,
+  keyClean: 0.6, wobble: 0, melody: 3, quantize: true,
+});
+export function defaultMaxSounding(preset) {
+  return preset === 'cover' ? 4 : preset === 'easy' ? 5 : 6;
+}
+
 // Krumhansl-Schmuckler profiles and duration-weighted Pearson correlation:
 // https://music21.org/music21docs/_modules/music21/analysis/discrete.html
 export function estimateKey(notes) {
@@ -75,6 +86,52 @@ export function trackVoice(groups, { intervalWeight = 0.08, preferHigher = true 
   return result.reverse();
 }
 
+// A skipped group costs 0.6. Subtracting that constant from every group makes
+// choosing a note a reward of 0.6 + amplitude; links may skip any number of groups.
+export function trackMelody(groups) {
+  const nodes = groups.flat();
+  if (!nodes.length) return [];
+  const amplitude = note => Math.max(0, Number.isFinite(note.amplitude) ? note.amplitude : 0.5);
+  const maximum = nodes.reduce((value, note) => Math.max(value, amplitude(note)), 0) || 1;
+  const end = note => note.end ?? note.startTimeSeconds + note.durationSeconds;
+  const costs = [], from = [], active = [];
+  let best = -1, at = 0;
+  const low = nodes.reduce((pitch, note) => Math.min(pitch, note.pitch), Infinity);
+  const high = nodes.reduce((pitch, note) => Math.max(pitch, note.pitch), -Infinity);
+  const maxTransition = 0.08 * (high - low) + 0.5;
+  for (const group of groups) {
+    const first = at;
+    for (const note of group) {
+      const reward = 0.6 + amplitude(note) / maximum;
+      let cost = -reward, predecessor = -1;
+      for (const j of active) {
+        const previous = nodes[j];
+        const candidate = costs[j] - reward + 0.08 * Math.abs(note.pitch - previous.pitch) +
+          (note.startTimeSeconds - end(previous) > 1 ? 0.5 : 0);
+        if (candidate < cost - 1e-9 || Math.abs(candidate - cost) <= 1e-9 &&
+          (predecessor < 0 || previous.pitch > nodes[predecessor].pitch)) {
+          cost = candidate;
+          predecessor = j;
+        }
+      }
+      costs.push(cost);
+      from.push(predecessor);
+      if (best < 0 || cost < costs[best] - 1e-9 ||
+        Math.abs(cost - costs[best]) <= 1e-9 && note.pitch > nodes[best].pitch) best = at;
+      at++;
+    }
+    // A path worse than the best by the maximum possible link cost cannot win.
+    // Pruning it keeps long songs small without changing the skip-DP objective.
+    for (let i = active.length - 1; i >= 0; i--) {
+      if (costs[active[i]] > costs[best] + maxTransition + 1e-9) active.splice(i, 1);
+    }
+    for (let i = first; i < at; i++) active.push(i);
+  }
+  const line = [];
+  for (let i = best; i >= 0; i = from[i]) line.push(nodes[i]);
+  return line.reverse();
+}
+
 // A 10 ms onset curve keeps the autocorrelation small even for long recordings.
 export function estimateTempo(notes) {
   const timed = notes.filter(note => Number.isFinite(note?.startTimeSeconds) && note.startTimeSeconds >= 0 &&
@@ -123,23 +180,35 @@ export function estimateTempo(notes) {
   const [lag, peak] = best, before = scores.get(lag - 1) ?? peak, after = scores.get(lag + 1) ?? peak;
   const correction = before - 2 * peak + after ? Math.max(-0.5, Math.min(0.5, 0.5 * (before - after) / (before - 2 * peak + after))) : 0;
   const centre = Math.max(60, Math.min(180, 60 / ((lag + correction) * bin)));
-  let bpm = centre, phase = 0, bestPhase = -Infinity;
   // Refine the autocorrelation bin: a small BPM rounding error drifts across a song.
-  for (let p = -100; p <= 100; p++) {
-    const candidate = Math.max(60, Math.min(180, centre * (1 + p / 10000))), step = 60 / candidate / 4;
-    let real = 0, imaginary = 0, total = 0;
-    for (const note of timed) {
-      const weight = Math.max(0, Number.isFinite(note.amplitude) ? note.amplitude : 0.5) *
-        (Number.isFinite(note.onset) ? Math.max(0.05, note.onset) : 1);
-      const angle = 2 * Math.PI * (note.startTimeSeconds - first) / step;
-      real += weight * Math.cos(angle); imaginary += weight * Math.sin(angle); total += weight;
+  const refine = centre => {
+    let bpm = centre, phase = 0, bestPhase = -Infinity;
+    for (let p = -100; p <= 100; p++) {
+      const candidate = Math.max(60, Math.min(180, centre * (1 + p / 10000))), step = 60 / candidate / 4;
+      let real = 0, imaginary = 0, total = 0;
+      for (const note of timed) {
+        const weight = Math.max(0, Number.isFinite(note.amplitude) ? note.amplitude : 0.5) *
+          (Number.isFinite(note.onset) ? Math.max(0.05, note.onset) : 1);
+        const angle = 2 * Math.PI * (note.startTimeSeconds - first) / step;
+        real += weight * Math.cos(angle); imaginary += weight * Math.sin(angle); total += weight;
+      }
+      const score = total ? Math.hypot(real, imaginary) / total : 0;
+      if (score > bestPhase) {
+        bestPhase = score; bpm = candidate;
+        phase = ((Math.atan2(imaginary, real) / (2 * Math.PI) % 1 + 1) % 1) * step;
+      }
     }
-    const score = total ? Math.hypot(real, imaginary) / total : 0;
-    if (score > bestPhase) {
-      bestPhase = score; bpm = candidate;
-      phase = ((Math.atan2(imaginary, real) / (2 * Math.PI) % 1 + 1) % 1) * step;
-    }
+    return { bpm, phase, bestPhase };
+  };
+  let chosen = refine(centre);
+  // A clear phase advantage can resolve an octave missed by the coarse lag bins.
+  for (const factor of [2, 0.5]) {
+    const alternative = centre * factor;
+    if (alternative < 60 || alternative > 180) continue;
+    const refined = refine(alternative);
+    if (refined.bestPhase >= 1.5 * chosen.bestPhase) chosen = refined;
   }
+  let { bpm, phase, bestPhase } = chosen;
   const step = 60 / bpm / 4;
   phase = (phase + first) % step;
   const deviation = timed.reduce((sum, note) => sum + Math.abs(note.startTimeSeconds - phase -
@@ -162,15 +231,29 @@ export function quantizeNotes(notes, timing, { preset = 'full', enabled = true }
     return { ...note, startTimeSeconds, end: Math.max(startTimeSeconds + minimum, Math.round(note.end / step) * step) };
   });
   const protectedNotes = new Set();
-  const protect = index => {
+  const byStart = original.map((_, i) => i).sort((a, b) => original[a].startTimeSeconds - original[b].startTimeSeconds);
+  const rank = new Map(byStart.map((index, position) => [index, position]));
+  const protectOne = index => {
     if (protectedNotes.has(index)) return false;
     protectedNotes.add(index); result[index] = { ...original[index] }; return true;
+  };
+  // Reverting only a re-strike tears its chord away from the partners still on the grid.
+  const protect = index => {
+    let changed = false;
+    const position = rank.get(index), start = original[index].startTimeSeconds;
+    for (let i = position; i >= 0 && start - original[byStart[i]].startTimeSeconds <= 0.03 + 1e-9; i--) {
+      changed = protectOne(byStart[i]) || changed;
+    }
+    for (let i = position + 1; i < byStart.length && original[byStart[i]].startTimeSeconds - start <= 0.03 + 1e-9; i++) {
+      changed = protectOne(byStart[i]) || changed;
+    }
+    return changed;
   };
   let changed;
   do {
     changed = false;
     const byPitch = new Map();
-    for (const i of original.map((_, i) => i).sort((a, b) => original[a].startTimeSeconds - original[b].startTimeSeconds)) {
+    for (const i of byStart) {
       const last = byPitch.get(result[i].pitch);
       if (last !== undefined) {
         const gap = result[i].startTimeSeconds - result[last].end;
@@ -184,6 +267,18 @@ export function quantizeNotes(notes, timing, { preset = 'full', enabled = true }
         }
       }
       byPitch.set(result[i].pitch, i);
+    }
+    // Mixing protected and snapped attacks must not reverse their original order.
+    for (const hand of [undefined, 'left', 'right']) {
+      const order = hand ? byStart.filter(index => original[index].hand === hand) : byStart;
+      for (let i = 1; i < order.length; i++) {
+        const previous = order[i - 1], current = order[i];
+        if (original[current].startTimeSeconds - original[previous].startTimeSeconds > 0.03 + 1e-9 &&
+          result[current].startTimeSeconds < result[previous].startTimeSeconds - 1e-9) {
+          changed = protect(previous) || changed;
+          changed = protect(current) || changed;
+        }
+      }
     }
     const order = result.map((_, i) => i).sort((a, b) => result[a].startTimeSeconds - result[b].startTimeSeconds);
     for (let i = 0; i < order.length;) {
@@ -205,12 +300,13 @@ export function quantizeNotes(notes, timing, { preset = 'full', enabled = true }
     quantized: true, quantizedNotes: result.length - protectedNotes.size, timingOffsetSeconds: offset };
 }
 
-export function toPianoNotes(notes, {
-  maxPoly = 6, legato = 0.7, harmonic = 0.6, align = 30, dynamics = true, ghost = 0.35, splitAt = 0,
-  preset = 'full', minSounding = 100, legatoGap = 0,
-  maxSounding = preset === 'cover' ? 4 : preset === 'easy' ? 5 : 6, keyClean = 0.6, wobble = 0, melody = 3,
-  quantize = true,
-} = {}) {
+export function toPianoNotes(notes, options = {}) {
+  const settings = { ...pianoDefaults };
+  for (const [key, value] of Object.entries(options)) if (value !== undefined) settings[key] = value;
+  const {
+    maxPoly, legato, harmonic, align, dynamics, ghost, splitAt, preset, minSounding, legatoGap,
+    maxSounding = defaultMaxSounding(preset), keyClean, wobble, melody, quantize,
+  } = settings;
   const sorted = notes.filter(note => note && Number.isFinite(note.pitchMidi) &&
     Number.isFinite(note.startTimeSeconds) && note.startTimeSeconds >= 0 &&
     Number.isFinite(note.durationSeconds) && note.durationSeconds > 0 &&
@@ -414,6 +510,7 @@ export function toPianoNotes(notes, {
     // A removed anchor can join neighbouring groups; reassign until no more notes disappear.
   } while (kept.length < previousCount);
 
+  let arrangementBass;
   if (preset === 'easy' || preset === 'cover') {
     const scale = estimateKey(kept)?.scale ?? [];
     let previousArrangement, strongNotes;
@@ -430,7 +527,7 @@ export function toPianoNotes(notes, {
       const left = groups.map(group => group.filter(note => note.hand === 'left'));
       const top = group => group.reduce((best, note) => !best || note.pitch > best.pitch ? note : best, null);
       const bottom = group => group.reduce((best, note) => !best || note.pitch < best.pitch ? note : best, null);
-      const melodyLine = melody > 0 ? trackVoice(right) : right.map(top).filter(Boolean);
+      const melodyLine = melody > 0 ? trackMelody(right) : right.map(top).filter(Boolean);
       const bassLine = preset === 'cover' ? trackVoice(left, { intervalWeight: 0.04, preferHigher: false })
         : left.map(bottom).filter(Boolean);
       const chosen = new Set([...melodyLine, ...bassLine]);
@@ -443,6 +540,7 @@ export function toPianoNotes(notes, {
             .sort((a, b) => b.amplitude - a.amplitude || a.pitch - b.pitch).slice(0, 2)) chosen.add(note);
         }
       }
+      arrangementBass = new Set(bassLine);
       const voices = new Set([...melodyLine, ...bassLine]);
       kept = groups.flatMap(group => group.filter(note => chosen.has(note) &&
         (preset !== 'easy' || note.end - note.startTimeSeconds >= 0.12 - 1e-9))
@@ -453,6 +551,35 @@ export function toPianoNotes(notes, {
       }
       // Removing an early attack can join neighbouring groups; choose again until stable.
     } while (kept.length < previousArrangement);
+  }
+
+  if (preset === 'cover') {
+    const beat = quantize && tempo.eligible ? 60 / tempo.estimatedBpm : 0.3;
+    const phase = quantize && tempo.eligible ? tempo.gridPhaseSeconds : 0;
+    const selectedLeft = new Set();
+    let previousBass, previousBeat, previousChord;
+    for (const note of kept.filter(note => arrangementBass.has(note))) {
+      const bucket = Math.floor((note.startTimeSeconds - phase) / beat + 1e-9);
+      if (bucket === previousBeat || previousBass && previousBass.pitch % 12 === note.pitch % 12 &&
+        previousBass.end > note.startTimeSeconds) continue;
+      selectedLeft.add(note);
+      previousBeat = bucket;
+      previousBass = note;
+    }
+    for (let i = 0; i < kept.length;) {
+      let end = i + 1;
+      while (end < kept.length && kept[end].startTimeSeconds - kept[i].startTimeSeconds <= 0.03 + 1e-9) end++;
+      const left = kept.slice(i, end).filter(note => note.hand === 'left');
+      const signature = [...new Set(left.map(note => note.pitch % 12))].sort((a, b) => a - b).join(',');
+      // Chord changes accompany a retained bass attack, not every detected transient.
+      if (signature !== previousChord && left.some(note => selectedLeft.has(note))) {
+        for (const note of left) if (!arrangementBass.has(note)) selectedLeft.add(note);
+        previousChord = signature;
+      }
+      for (const note of left) note.chord = left.filter(other => selectedLeft.has(other)).length > 1;
+      i = end;
+    }
+    kept = kept.filter(note => note.hand === 'right' || selectedLeft.has(note));
   }
 
   const nextByPitch = new Map(), nextByHand = new Map();

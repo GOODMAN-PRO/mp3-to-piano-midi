@@ -5,11 +5,15 @@ import { spawnSync } from 'node:child_process';
 import { BasicPitch } from '@spotify/basic-pitch';
 import * as tf from '@tensorflow/tfjs';
 import { extractNotes } from './extract.js';
-import { estimateKey, toPianoNotes } from './piano.js';
+import { estimateKey, pianoDefaults, defaultMaxSounding, toPianoNotes } from './piano.js';
 import { notesToMidi } from './midi.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
-export const defaults = { onset: 0.5, frame: 0.3, min: 80, poly: 6, tolerance: 11, legato: 0.7, harmonic: 0.6, align: 30, ghost: 0.35, splitAt: 0, minSounding: 100, legatoGap: 0, maxSounding: 6, keyClean: 0.6, wobble: 0, melody: 3, preset: 'full', quantize: true };
+const { onsetThresh, frameThresh, minMs, energyTolerance, maxPoly, ...arrangementDefaults } = pianoDefaults;
+export const defaults = {
+  ...arrangementDefaults, onset: onsetThresh, frame: frameThresh, min: minMs,
+  tolerance: energyTolerance, poly: maxPoly, maxSounding: defaultMaxSounding(pianoDefaults.preset),
+};
 
 export function noteStats(notes) {
   const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
@@ -237,27 +241,27 @@ async function modelOutput(input) {
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes('--help')) {
-    const flags = Object.entries(defaults).filter(([key]) => key !== 'quantize').map(([key, value]) => `[--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} ${value}]`).join(' ');
+    const flags = Object.entries(defaults).filter(([, value]) => typeof value !== 'boolean').map(([key, value]) => `[--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} ${value}]`).join(' ');
     console.log(`Usage: node cli.mjs <audio file> [--out file.mid] ${flags} [--no-dynamics] [--no-split] [--no-quantize] [--json]`);
-    console.log('--preset accepts full, easy or cover; their --max-sounding defaults are 6, 5 and 4. Set --min-sounding 0 or --legato-gap 0 to disable length smoothing.');
+    console.log(`--preset accepts full, easy or cover; their --max-sounding defaults are ${['full', 'easy', 'cover'].map(defaultMaxSounding).join(', ')}. Set --min-sounding 0 or --legato-gap 0 to disable length smoothing.`);
     console.log('--max-sounding, --key-clean and --wobble accept 0 to disable their cleanup steps; --melody 0 restores highest-note selection in Easy/Cover. Quantization skips short clips and weak tempo estimates.');
     return;
   }
   const input = resolve(args.shift());
   const options = { ...defaults };
   let output = join(dirname(input), `${basename(input, extname(input))}.mid`);
-  let splitHands = true, dynamics = true, json = false, maxSoundingSet = false;
+  let splitHands = true, json = false, maxSoundingSet = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     const key = arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
     if (arg === '--no-split') splitHands = false;
-    else if (arg === '--no-dynamics') dynamics = false;
+    else if (arg === '--no-dynamics') options.dynamics = false;
     else if (arg === '--no-quantize') options.quantize = false;
     else if (arg === '--json') json = true;
     else if (arg === '--out') {
       if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error('--out needs a filename.');
       output = resolve(args[++i]);
-    } else if (arg.startsWith('--') && key !== 'quantize' && Object.hasOwn(options, key)) {
+    } else if (arg.startsWith('--') && typeof options[key] !== 'boolean' && Object.hasOwn(options, key)) {
       const value = key === 'preset' ? args[++i] : Number(args[++i]);
       if (key !== 'preset' && !Number.isFinite(value)) throw new Error(`${arg} needs a finite number.`);
       options[key] = value;
@@ -268,7 +272,7 @@ async function main() {
     if (options[key] < 0 || options[key] > 1) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be between 0 and 1.`);
   }
   if (!['full', 'easy', 'cover'].includes(options.preset)) throw new Error('--preset must be full, easy or cover.');
-  if (!maxSoundingSet) options.maxSounding = { full: 6, easy: 5, cover: 4 }[options.preset];
+  if (!maxSoundingSet) options.maxSounding = defaultMaxSounding(options.preset);
   for (const key of ['align', 'minSounding', 'legatoGap', 'wobble']) {
     if (options[key] < 0) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be nonnegative.`);
   }
@@ -284,15 +288,9 @@ async function main() {
   const notes = extractNotes(frames, onsets, {
     onsetThresh: options.onset, frameThresh: options.frame, minMs: options.min, energyTolerance: options.tolerance,
   });
-  const piano = toPianoNotes(notes, {
-    maxPoly: options.poly, legato: options.legato, harmonic: options.harmonic,
-    align: options.align, ghost: options.ghost, dynamics, splitAt: options.splitAt,
-    minSounding: options.minSounding, legatoGap: options.legatoGap, preset: options.preset,
-    maxSounding: options.maxSounding, keyClean: options.keyClean, wobble: options.wobble, melody: options.melody,
-    quantize: options.quantize,
-  });
+  const piano = toPianoNotes(notes, { ...options, maxPoly: options.poly });
   writeFileSync(output, notesToMidi(piano, { splitHands }));
-  const stats = { input, output, cacheHit, parameters: { ...options, dynamics, splitHands }, ...noteStats(piano) };
+  const stats = { input, output, cacheHit, parameters: { ...options, splitHands }, ...noteStats(piano) };
   if (json) console.log(JSON.stringify(stats));
   else {
     console.log(`Wrote ${output}`);

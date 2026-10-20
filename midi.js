@@ -25,14 +25,20 @@ export function notesToMidi(pianoNotes, { splitHands = true } = {}) {
     if (!Number.isSafeInteger(ticks) || !Number.isSafeInteger(end)) continue;
     const safeVelocity = Number.isFinite(velocity) ? Math.min(1, Math.max(1 / 127, velocity)) : 0.7;
     const previous = previousByPitch.get(pitch);
+    const right = hand === 'right' || hand !== 'left' && pitch >= 60;
+    const otherTrack = splitHands && previous && previous.right !== right;
     // Sub-tick re-strikes can round to one tick, even when assigned different hands.
-    if (previous && previous.ticks === ticks) {
-      previous.durationTicks = Math.max(previous.durationTicks, end - ticks);
+    // Adjacent ticks in different tracks also cannot fit a note-off gap and a positive duration.
+    if (previous && (previous.ticks === ticks || otherTrack && ticks - previous.ticks === 1)) {
+      previous.durationTicks = Math.max(previous.durationTicks, end - previous.ticks);
       previous.velocity = Math.max(previous.velocity, safeVelocity);
       continue;
     }
-    if (previous && previous.ticks + previous.durationTicks > ticks) previous.durationTicks = ticks - previous.ticks;
-    const note = { pitch, hand, ticks, durationTicks: Math.max(1, end - ticks),
+    if (previous && previous.ticks + previous.durationTicks >= ticks) {
+      // Both tracks use channel 0; release before the other track's note-on, regardless of merge order.
+      previous.durationTicks = Math.max(1, ticks - previous.ticks - (otherTrack ? 1 : 0));
+    }
+    const note = { pitch, hand, right, ticks, durationTicks: Math.max(1, end - ticks),
       velocity: safeVelocity };
     previousByPitch.set(pitch, note);
     quantized.push(note);
